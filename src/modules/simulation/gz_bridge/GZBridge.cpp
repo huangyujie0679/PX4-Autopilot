@@ -229,7 +229,7 @@ bool GZBridge::subscribeMag(bool required)
 {
 	std::string mag_topic = "/world/" + _world_name + "/model/" + _model_name +
 				"/link/base_link/sensor/magnetometer_sensor/magnetometer";
-
+	PX4_INFO("MAG SUBSCRIBE TOPIC: %s", mag_topic.c_str());
 	if (!_node.Subscribe(mag_topic, &GZBridge::magnetometerCallback, this)) {
 		PX4_ERR("failed to subscribe to %s", mag_topic.c_str());
 		return required ? false : true;
@@ -382,6 +382,7 @@ void GZBridge::opticalFlowCallback(const px4::msgs::OpticalFlow &msg)
 
 void GZBridge::magnetometerCallback(const gz::msgs::Magnetometer &msg)
 {
+	// PX4_INFO("MAG CALLBACK OK");
 	const uint64_t timestamp = hrt_absolute_time();
 
 	device::Device::DeviceId id{};

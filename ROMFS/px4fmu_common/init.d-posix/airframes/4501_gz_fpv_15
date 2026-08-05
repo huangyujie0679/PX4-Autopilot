@@ -9,7 +9,7 @@
 
 PX4_SIMULATOR=${PX4_SIMULATOR:=gz}
 PX4_GZ_WORLD=${PX4_GZ_WORLD:=fpv_attack}
-PX4_SIM_MODEL=${PX4_SIM_MODEL:=fpv_15}
+PX4_SIM_MODEL=${PX4_SIM_MODEL:=fpv_15_0}
 
 # 启用 Gazebo 仿真接口
 # SIM_GZ_EN=1 表示打开 Gazebo 8 物理/桥接接口，接受 PX4 控制输出。
