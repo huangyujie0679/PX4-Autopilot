@@ -1,0 +1,82 @@
+#!/bin/sh
+#
+# @name Gazebo FPV 15 inch
+#
+# @type Quadrotor
+#
+
+. ${R}etc/init.d/rc.mc_defaults
+
+PX4_SIMULATOR=${PX4_SIMULATOR:=gz}
+PX4_GZ_WORLD=${PX4_GZ_WORLD:=fpv_attack}
+PX4_SIM_MODEL=${PX4_SIM_MODEL:=fpv_15}
+
+# 启用 Gazebo 仿真接口
+# SIM_GZ_EN=1 表示打开 Gazebo 8 物理/桥接接口，接受 PX4 控制输出。
+param set-default SIM_GZ_EN 1
+
+# 控制分配类型：0 表示自定义四旋翼，使用显式 rotor 位置
+# CA_AIRFRAME=0 说明本机体使用手工指定的 4 个电机位置和转向，而不是通用模板。
+param set-default CA_AIRFRAME 0
+# 旋翼数量：4 个电机
+param set-default CA_ROTOR_COUNT 4
+
+# rotor0 位置：机体前右，X 正前、Y 负右，15 寸机臂长约 0.26 米
+param set-default CA_ROTOR0_PX 0.227
+param set-default CA_ROTOR0_PY 0.227
+# rotor0 垂直位置，通常与机体质心高度一致
+param set-default CA_ROTOR0_PZ 0.0
+# rotor0 的推力系数，用于控制分配归一化
+# 推力系数1.0。
+param set-default CA_ROTOR0_CT 1.0
+# rotor0 的 yaw 扭矩符号，正值表示该旋翼产生正 yaw 扭矩
+# 旋翼反扭矩系数近似取 0.018。CA_ROTOR0_KM的值等于1N推力产生多少的扭矩，单位为N*m/N。对于小型穿越机，通常在0.015-0.02之间。
+param set-default CA_ROTOR0_KM  0.018
+
+# rotor1 位置：机体后左，X 负后、Y 正左
+param set-default CA_ROTOR1_PX -0.227
+param set-default CA_ROTOR1_PY -0.227
+param set-default CA_ROTOR1_PZ 0.0
+param set-default CA_ROTOR1_CT 1.0
+param set-default CA_ROTOR1_KM  0.018
+
+# rotor2 位置：机体前左，X 正前、Y 正左
+param set-default CA_ROTOR2_PX 0.227
+param set-default CA_ROTOR2_PY -0.227
+param set-default CA_ROTOR2_PZ 0.0
+param set-default CA_ROTOR2_CT 1.0
+# rotor2 与 rotor0 旋转方向相反，因此 yaw 符号取负
+param set-default CA_ROTOR2_KM -0.018
+
+# rotor3 位置：机体后右，X 负后、Y 负右
+param set-default CA_ROTOR3_PX -0.227
+param set-default CA_ROTOR3_PY 0.227
+param set-default CA_ROTOR3_PZ 0.0
+param set-default CA_ROTOR3_CT 1.0
+param set-default CA_ROTOR3_KM -0.018
+
+# 仿真中 4 个电调通道对应的功能号
+param set-default SIM_GZ_EC_FUNC1 101
+param set-default SIM_GZ_EC_FUNC2 102
+param set-default SIM_GZ_EC_FUNC3 103
+param set-default SIM_GZ_EC_FUNC4 104
+
+# 电调最小 PWM 值，保持转子空转不熄火
+# 这里的 PWM 值通常需要与电调/ESC 导通和实际限幅相匹配。
+param set-default SIM_GZ_EC_MIN1 150
+param set-default SIM_GZ_EC_MIN2 150
+param set-default SIM_GZ_EC_MIN3 150
+param set-default SIM_GZ_EC_MIN4 150
+
+# 电调最大 PWM 值，对应满油门
+param set-default SIM_GZ_EC_MAX1 1000
+param set-default SIM_GZ_EC_MAX2 1000
+param set-default SIM_GZ_EC_MAX3 1000
+param set-default SIM_GZ_EC_MAX4 1000
+
+# 悬停油门估算值，15 寸穿越机常见值约 0.55-0.65
+param set-default MPC_THR_HOVER 0.50
+# 导航 DLL 活动模式，保持默认值即可
+param set-default NAV_DLL_ACT 2
+
+

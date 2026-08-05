@@ -70,11 +70,25 @@ if (gz-transport_FOUND)
     add_subdirectory(generic_motor)
     add_subdirectory(buoyancy)
     add_subdirectory(spacecraft_thruster)
+    add_subdirectory(TargetMotion)
+
+
 
     # Add an alias target for each plugin
     if (TARGET GstCameraSystem)
         add_custom_target(px4_gz_plugins ALL DEPENDS OpticalFlowSystem MovingPlatformController TemplatePlugin GenericMotorModelPlugin BuoyancySystemPlugin GstCameraSystem SpacecraftThrusterModelPlugin)
     else()
-        add_custom_target(px4_gz_plugins ALL DEPENDS OpticalFlowSystem MovingPlatformController TemplatePlugin GenericMotorModelPlugin BuoyancySystemPlugin SpacecraftThrusterModelPlugin)
+        add_custom_target(px4_gz_plugins ALL DEPENDS
+            OpticalFlowSystem
+            MovingPlatformController
+            TemplatePlugin
+            GenericMotorModelPlugin
+            BuoyancySystemPlugin
+            SpacecraftThrusterModelPlugin
+            TargetMotionPlugin
+        )
+        add_dependencies(px4_gz_plugins TargetMotionPlugin)
     endif()
 endif()
+
+
