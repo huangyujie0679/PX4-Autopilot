@@ -25,35 +25,51 @@ param set-default CA_ROTOR_COUNT 4
 param set-default CA_ROTOR0_PX 0.227
 param set-default CA_ROTOR0_PY 0.227
 # rotor0 垂直位置，通常与机体质心高度一致
-param set-default CA_ROTOR0_PZ 0.0
+param set-default CA_ROTOR0_PZ 0
 # rotor0 的推力系数，用于控制分配归一化
 # 推力系数1.0。
 param set-default CA_ROTOR0_CT 1.0
 # rotor0 的 yaw 扭矩符号，正值表示该旋翼产生正 yaw 扭矩
 # 旋翼反扭矩系数近似取 0.018。CA_ROTOR0_KM的值等于1N推力产生多少的扭矩，单位为N*m/N。对于小型穿越机，通常在0.015-0.02之间。
-param set-default CA_ROTOR0_KM  0.018
+param set-default CA_ROTOR0_KM  0.18
 
 # rotor1 位置：机体后左，X 负后、Y 正左
 param set-default CA_ROTOR1_PX -0.227
 param set-default CA_ROTOR1_PY -0.227
-param set-default CA_ROTOR1_PZ 0.0
+param set-default CA_ROTOR1_PZ 0
 param set-default CA_ROTOR1_CT 1.0
-param set-default CA_ROTOR1_KM  0.018
+param set-default CA_ROTOR1_KM  0.18
 
 # rotor2 位置：机体前左，X 正前、Y 正左
 param set-default CA_ROTOR2_PX 0.227
 param set-default CA_ROTOR2_PY -0.227
-param set-default CA_ROTOR2_PZ 0.0
+param set-default CA_ROTOR2_PZ 0
 param set-default CA_ROTOR2_CT 1.0
 # rotor2 与 rotor0 旋转方向相反，因此 yaw 符号取负
-param set-default CA_ROTOR2_KM -0.018
+param set-default CA_ROTOR2_KM -0.18
 
 # rotor3 位置：机体后右，X 负后、Y 负右
 param set-default CA_ROTOR3_PX -0.227
 param set-default CA_ROTOR3_PY 0.227
-param set-default CA_ROTOR3_PZ 0.0
+param set-default CA_ROTOR3_PZ 0
 param set-default CA_ROTOR3_CT 1.0
-param set-default CA_ROTOR3_KM -0.018
+param set-default CA_ROTOR3_KM -0.18
+
+param set-default CA_ROTOR0_AX 0
+param set-default CA_ROTOR0_AY 0
+param set-default CA_ROTOR0_AZ -1
+
+param set-default CA_ROTOR1_AX 0
+param set-default CA_ROTOR1_AY 0
+param set-default CA_ROTOR1_AZ -1
+
+param set-default CA_ROTOR2_AX 0
+param set-default CA_ROTOR2_AY 0
+param set-default CA_ROTOR2_AZ -1
+
+param set-default CA_ROTOR3_AX 0
+param set-default CA_ROTOR3_AY 0
+param set-default CA_ROTOR3_AZ -1
 
 # 仿真中 4 个电调通道对应的功能号
 param set-default SIM_GZ_EC_FUNC1 101
