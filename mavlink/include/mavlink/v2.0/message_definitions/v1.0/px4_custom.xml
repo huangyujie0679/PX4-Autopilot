@@ -1,0 +1,41 @@
+<?xml version="1.0"?>
+<mavlink>
+
+<messages>
+
+<message id="42000" name="TARGET_LOS">
+
+    <description>
+    Target line of sight information from vision computer
+    </description>
+
+    <field type="float" name="los_azimuth">
+        LOS azimuth angle rad
+    </field>
+
+    <field type="float" name="los_elevation">
+        LOS elevation angle rad
+    </field>
+
+
+    <field type="float" name="los_az_rate">
+        LOS azimuth angular velocity rad/s
+    </field>
+
+
+    <field type="float" name="los_el_rate">
+        LOS elevation angular velocity rad/s
+    </field>
+
+
+    <field type="uint8_t" name="target_valid">
+        Target detection status
+    </field>
+
+
+</message>
+
+
+</messages>
+
+</mavlink>

@@ -280,7 +280,40 @@ MavlinkReceiver::handle_message(mavlink_message_t *msg)
 	case MAVLINK_MSG_ID_OPEN_DRONE_ID_SYSTEM:
 		handle_message_open_drone_id_system(msg);
 		break;
+	case MAVLINK_MSG_ID_TARGET_LOS:
+	{
+	    mavlink_target_los_t target_los;
 
+	    mavlink_msg_target_los_decode(
+		    msg,
+		    &target_los
+	    );
+
+
+	    vehicle_target_los_s los{};
+
+	    los.timestamp =
+		    hrt_absolute_time();
+
+	    los.los_azimuth =
+		    target_los.los_azimuth;
+
+	    los.los_elevation =
+		    target_los.los_elevation;
+
+	    los.los_az_rate =
+		    target_los.los_az_rate;
+
+	    los.los_el_rate =
+		    target_los.los_el_rate;
+
+	    los.target_valid =
+		    target_los.target_valid;
+
+	    _vehicle_target_los_pub.publish(los);
+
+	    break;
+	}
 #if !defined(CONSTRAINED_FLASH)
 
 	case MAVLINK_MSG_ID_NAMED_VALUE_FLOAT:

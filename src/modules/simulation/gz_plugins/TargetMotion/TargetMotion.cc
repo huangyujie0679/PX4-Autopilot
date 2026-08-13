@@ -256,7 +256,7 @@ void TargetMotion::PreUpdate(
         amplitude*
         sin(speed*time_s);
 
-        y=500;
+        y=0;
 
         z=altitude;
 

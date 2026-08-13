@@ -1,0 +1,6 @@
+config MODULES_PN_GUIDANCE
+	bool "PN Guidance"
+	default y
+	help
+		Proportional Navigation guidance module.
+		Receives target LOS angular velocity and generates guidance commands.
