@@ -1,231 +1,332 @@
 #include "acceleration_to_attitude.hpp"
 
 #include <cmath>
-#include <px4_platform_common/log.h>
-#include <px4_platform_common/time.h>
 
 using namespace matrix;
 
 
-Quatf AccelerationToAttitude::calculate(
-	const Vector3f &accel_body,
-	const Quatf &q_current,
-	float yaw_sp)
+namespace
 {
+
+constexpr float GRAVITY =
+	9.80665f;
+
+
+float constrainFloat(
+	float value,
+	float minimum,
+	float maximum)
+{
+	if (value < minimum) {
+		return minimum;
+	}
+
+	if (value > maximum) {
+		return maximum;
+	}
+
+	return value;
+}
+
+
+float norm3(
+	const Vector3f &v)
+{
+	return sqrtf(
+		v(0) * v(0)
+		+
+		v(1) * v(1)
+		+
+		v(2) * v(2)
+	);
+}
+
+}
+
+
+AccelerationToAttitude::Result
+AccelerationToAttitude::calculate(
+	const Vector3f &accel_sp_ned,
+	float yaw_sp,
+	float hover_thrust)
+{
+	Result result{};
+
+
 	/*
 	 * ============================================================
-	 * 1. 当前姿态：Body -> NED
-	 * ============================================================
-	 */
-
-	Dcmf R_nb(q_current);
-
-
-	/*
-	 * ============================================================
-	 * 2. 将机体系期望加速度转换到 NED
+	 * 车辆动力学：
 	 *
-	 * Body FRD:
-	 * X Forward
-	 * Y Right
-	 * Z Down
+	 * a_des =
 	 *
-	 * NED:
-	 * X North
-	 * Y East
-	 * Z Down
-	 * ============================================================
-	 */
-
-	Vector3f accel_ned = R_nb * accel_body;
-
-
-	/*
-	 * ============================================================
-	 * 3. 加入重力
+	 * gravity
+	 * +
+	 * thrust_specific_force
 	 *
-	 * NED中重力方向：
+	 *
+	 * NED中：
+	 *
+	 * gravity =
 	 *
 	 * [0, 0, +g]
 	 *
-	 * 要产生期望加速度，需要的合力：
 	 *
-	 * F = a - g
+	 * 因此：
 	 *
+	 * thrust_accel =
+	 *
+	 * a_des - gravity
+	 *
+	 * 多旋翼实际推力方向为：
+	 *
+	 * Body -Z
 	 * ============================================================
 	 */
 
-	const float g = 9.81f;
-
-	Vector3f force_ned;
-
-	force_ned(0) = accel_ned(0);
-	force_ned(1) = accel_ned(1);
-	force_ned(2) = accel_ned(2) - g;
+	const Vector3f gravity_ned{
+		0.0f,
+		0.0f,
+		GRAVITY
+	};
 
 
-	/*
-	 * ============================================================
-	 * 4. 判断合力是否有效
-	 * ============================================================
-	 */
+	Vector3f thrust_accel_ned =
+		accel_sp_ned
+		-
+		gravity_ned;
 
-	if (force_ned.norm() < 0.01f)
-	{
-		return Quatf(
-			Eulerf(
-				0.0f,
-				0.0f,
-				yaw_sp
-			)
+
+	float thrust_accel_norm =
+		norm3(
+			thrust_accel_ned
 		);
+
+
+	if (thrust_accel_norm < 0.01f) {
+
+		thrust_accel_ned =
+			Vector3f{
+				0.0f,
+				0.0f,
+				-GRAVITY
+			};
+
+		thrust_accel_norm =
+			GRAVITY;
 	}
 
 
 	/*
 	 * ============================================================
-	 * 5. 计算期望机体Z轴
+	 * Body +Z 与真实推力方向相反。
 	 *
-	 * PX4机体系：
+	 * 所以：
 	 *
-	 * Zb = Down
+	 * body_z_des =
 	 *
-	 * 推力方向与合力方向相反。
+	 * -thrust_accel / |thrust_accel|
 	 * ============================================================
 	 */
 
-	Vector3f zb = -force_ned.normalized();
+	Vector3f body_z_des =
+		-thrust_accel_ned
+		/
+		thrust_accel_norm;
 
 
 	/*
 	 * ============================================================
-	 * 6. 根据固定yaw构造水平X轴参考方向
+	 * 固定yaw。
+	 *
+	 * 构造世界水平面上的yaw参考Y轴。
 	 * ============================================================
 	 */
 
-	Vector3f xc(
-		cosf(yaw_sp),
-		sinf(yaw_sp),
+	const Vector3f y_c{
+
+		-sinf(
+			yaw_sp),
+
+		cosf(
+			yaw_sp),
+
 		0.0f
+	};
+
+
+	/*
+	 * ============================================================
+	 * body_x =
+	 *
+	 * y_c × body_z
+	 * ============================================================
+	 */
+
+	Vector3f body_x_des =
+		y_c.cross(
+			body_z_des
+		);
+
+
+	float body_x_norm =
+		norm3(
+			body_x_des
+		);
+
+
+	/*
+	 * 接近奇异状态保护。
+	 */
+	if (body_x_norm < 0.001f) {
+
+		body_x_des =
+			Vector3f{
+
+				cosf(
+					yaw_sp),
+
+				sinf(
+					yaw_sp),
+
+				0.0f
+			};
+
+		body_x_norm =
+			1.0f;
+	}
+
+
+	body_x_des /=
+		body_x_norm;
+
+
+	/*
+	 * ============================================================
+	 * body_y =
+	 *
+	 * body_z × body_x
+	 * ============================================================
+	 */
+
+	Vector3f body_y_des =
+		body_z_des.cross(
+			body_x_des
+		);
+
+
+	const float body_y_norm =
+		norm3(
+			body_y_des
+		);
+
+
+	if (body_y_norm > 0.001f) {
+
+		body_y_des /=
+			body_y_norm;
+	}
+
+
+	/*
+	 * ============================================================
+	 * Body FRD -> NED
+	 *
+	 * DCM三列分别是：
+	 *
+	 * body X轴在NED中的方向
+	 * body Y轴在NED中的方向
+	 * body Z轴在NED中的方向
+	 * ============================================================
+	 */
+
+	Dcmf R_sp;
+
+	R_sp.setCol(
+		0,
+		body_x_des
+	);
+
+	R_sp.setCol(
+		1,
+		body_y_des
+	);
+
+	R_sp.setCol(
+		2,
+		body_z_des
 	);
 
 
-	/*
-	 * ============================================================
-	 * 7. 计算机体Y轴
-	 * ============================================================
-	 */
-
-	Vector3f yb = zb % xc;
-
-
-	if (yb.norm() < 0.01f)
-	{
-		/*
-		 * 当zb与xc接近平行时，使用yaw方向的水平Y轴
-		 */
-
-		yb = Vector3f(
-			-sinf(yaw_sp),
-			cosf(yaw_sp),
-			0.0f
+	result.q_d =
+		Quatf(
+			R_sp
 		);
-	}
-	else
-	{
-		yb.normalize();
-	}
+
+	result.q_d.normalize();
 
 
 	/*
 	 * ============================================================
-	 * 8. 重新计算机体X轴
+	 * thrust归一化。
+	 *
+	 * hover_thrust对应：
+	 *
+	 * |a_thrust| = g
+	 *
+	 * 所以：
+	 *
+	 * thrust =
+	 *
+	 * hover_thrust
+	 * *
+	 * |a_thrust| / g
 	 * ============================================================
 	 */
 
-	Vector3f xb = yb % zb;
+	float thrust_norm =
 
-	xb.normalize();
+		hover_thrust
 
+		*
 
-	/*
-	 * ============================================================
-	 * 9. 构造期望姿态
-	 *
-	 * R_des：
-	 *
-	 * Body -> NED
-	 *
-	 * 每一列分别是机体X/Y/Z轴在NED中的表示。
-	 * ============================================================
-	 */
+		thrust_accel_norm
 
-	Dcmf R_des;
+		/
 
-	R_des(0, 0) = xb(0);
-	R_des(1, 0) = xb(1);
-	R_des(2, 0) = xb(2);
-
-	R_des(0, 1) = yb(0);
-	R_des(1, 1) = yb(1);
-	R_des(2, 1) = yb(2);
-
-	R_des(0, 2) = zb(0);
-	R_des(1, 2) = zb(1);
-	R_des(2, 2) = zb(2);
+		GRAVITY;
 
 
-	/*
-	 * ============================================================
-	 * 10. DCM -> Quaternion
-	 * ============================================================
-	 */
+	thrust_norm =
+		constrainFloat(
 
-	Quatf q_out(R_des);
+			thrust_norm,
 
+			0.10f,
 
-	/*
-	 * ============================================================
-	 * 11. 调试输出
-	 *
-	 * 限制为1秒打印一次。
-	 *
-	 * 注意这里使用hrt_absolute_time()，
-	 * 不要直接写一个不存在的now变量。
-	 * ============================================================
-	 */
-
-	static hrt_abstime last_print_time = 0;
-	const hrt_abstime now = hrt_absolute_time();
-	if (now - last_print_time >= 5000000)
-	{
-		last_print_time = now;
-
-		Eulerf euler(q_out);
-
-		const double roll_deg =
-			static_cast<double>(euler.phi()) * 180.0 / M_PI;
-
-		const double pitch_deg =
-			static_cast<double>(euler.theta()) * 180.0 / M_PI;
-
-		const double yaw_deg =
-			static_cast<double>(euler.psi()) * 180.0 / M_PI;
-
-		PX4_INFO(
-			"ATT: %.1f %.1f %.1f",
-			roll_deg,
-			pitch_deg,
-			yaw_deg
+			0.95f
 		);
-	}
+
+
+	result.thrust_norm =
+		thrust_norm;
 
 
 	/*
-	 * ============================================================
-	 * 12. 返回期望姿态
-	 * ============================================================
+	 * PX4 multicopter：
+	 *
+	 * thrust_body Z为负值。
 	 */
 
-	return q_out;
+	result.thrust_body =
+		Vector3f{
+
+			0.0f,
+
+			0.0f,
+
+			-thrust_norm
+		};
+
+
+	return result;
 }
