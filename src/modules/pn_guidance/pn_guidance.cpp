@@ -424,7 +424,7 @@ private:
 	// 当前固定闭合速度。
 	static constexpr float
 	PN_VC_FIXED =
-		20.0f;
+		35.0f;
 
 
 	static constexpr float
