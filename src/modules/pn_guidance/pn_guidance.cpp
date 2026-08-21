@@ -322,18 +322,24 @@ private:
 	// 28m/s作为硬速度保护阈值。
 	// ============================================================
 
-	static constexpr float GUIDANCE_SPEED_CRUISE = 26.0f;
-	static constexpr float GUIDANCE_SPEED_MID_1 = 24.0f;
-	static constexpr float GUIDANCE_SPEED_MID_2 = 21.0f;
-	static constexpr float GUIDANCE_SPEED_MIN = 18.0f;
-	static constexpr float GUIDANCE_SPEED_HARD_LIMIT = 28.0f;
+	// static constexpr float GUIDANCE_SPEED_CRUISE = 26.0f;
+	// static constexpr float GUIDANCE_SPEED_MID_1 = 24.0f;
+	// static constexpr float GUIDANCE_SPEED_MID_2 = 21.0f;
+	// static constexpr float GUIDANCE_SPEED_MIN = 18.0f;
+	// static constexpr float GUIDANCE_SPEED_HARD_LIMIT = 28.0f;
+	static constexpr float GUIDANCE_SPEED_CRUISE = 80.0f;
+	static constexpr float GUIDANCE_SPEED_MID_1 = 75.0f;
+	static constexpr float GUIDANCE_SPEED_MID_2 = 70.0f;
+	static constexpr float GUIDANCE_SPEED_MIN = 65.0f;
+	static constexpr float GUIDANCE_SPEED_HARD_LIMIT = 82.0f;
 
 	static constexpr float LOS_RATE_SPEED_POINT_1 = 0.05f;
 	static constexpr float LOS_RATE_SPEED_POINT_2 = 0.15f;
 	static constexpr float LOS_RATE_SPEED_POINT_3 = 0.30f;
 
 	// 在目标速度前4m/s开始逐渐收掉轴向加速。
-	static constexpr float SPEED_ACCEL_TAPER_BAND = 4.0f;
+	// static constexpr float SPEED_ACCEL_TAPER_BAND = 4.0f;
+	static constexpr float SPEED_ACCEL_TAPER_BAND = 5.0f;
 
 	// 一旦超过动态目标速度就开始主动制动。
 	static constexpr float SPEED_BRAKE_DEADBAND = 0.0f;
@@ -341,7 +347,10 @@ private:
 	static constexpr float SPEED_BRAKE_ACCEL_MAX = 8.0f;
 
 	// 在28m/s之前提前1m/s进入硬保护，避免等超过28再反应。
-	static constexpr float HARD_SPEED_BRAKE_START = 27.0f;
+	// static constexpr float HARD_SPEED_BRAKE_START = 27.0f;
+	// static constexpr float HARD_SPEED_BRAKE_KP = 5.0f;
+	// static constexpr float HARD_SPEED_BRAKE_ACCEL_MAX = 10.0f;
+	static constexpr float HARD_SPEED_BRAKE_START = 81.0f;
 	static constexpr float HARD_SPEED_BRAKE_KP = 5.0f;
 	static constexpr float HARD_SPEED_BRAKE_ACCEL_MAX = 10.0f;
 
