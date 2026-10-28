@@ -1,0 +1,8 @@
+Task UART adapter plus V2.12 flight-telemetry extension.
+
+- The older Work Queue project in outputs/cgtd070_px4_app is untouched.
+- The existing 64-byte feedback field offsets and checksum decoder are unchanged.
+- The 44-byte packer now accepts a fixed FlightTelemetry input for bytes 8..37.
+- The no-telemetry overload remains and writes zero to bytes 8..42.
+- Host tests cover idle/93H/71H/3BH, telemetry byte offsets and checksums.
+- Cgtd070Status.msg intentionally publishes only four requested values.

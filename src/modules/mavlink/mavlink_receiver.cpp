@@ -282,37 +282,66 @@ MavlinkReceiver::handle_message(mavlink_message_t *msg)
 		break;
 	case MAVLINK_MSG_ID_TARGET_LOS:
 	{
-	    mavlink_target_los_t target_los;
+		mavlink_target_los_t target_los{};
 
-	    mavlink_msg_target_los_decode(
-		    msg,
-		    &target_los
-	    );
+		mavlink_msg_target_los_decode(
+			msg,
+			&target_los
+		);
 
+		vehicle_target_los_s los{};
 
-	    vehicle_target_los_s los{};
+		// ============================================================
+		// PX4本地时间戳
+		//
+		// 不直接使用视觉板卡 / Python发送端的时钟。
+		// ============================================================
 
-	    los.timestamp =
-		    hrt_absolute_time();
+		los.timestamp =
+			hrt_absolute_time();
 
-	    los.los_azimuth =
-		    target_los.los_azimuth;
+		// ============================================================
+		// 目标相对于当前相机光轴的残余LOS角
+		//
+		// 云台锁定良好时应接近0。
+		// ============================================================
 
-	    los.los_elevation =
-		    target_los.los_elevation;
+		los.los_azimuth =
+			target_los.los_azimuth;
 
-	    los.los_az_rate =
-		    target_los.los_az_rate;
+		los.los_elevation =
+			target_los.los_elevation;
 
-	    los.los_el_rate =
-		    target_los.los_el_rate;
+		// ============================================================
+		// 惯性LOS角速度
+		// ============================================================
 
-	    los.target_valid =
-		    target_los.target_valid;
+		los.los_az_rate =
+			target_los.los_az_rate;
 
-	    _vehicle_target_los_pub.publish(los);
+		los.los_el_rate =
+			target_los.los_el_rate;
 
-	    break;
+		// ============================================================
+		// 云台相对于机体的姿态
+		// ============================================================
+
+		los.gimbal_pitch =
+			target_los.gimbal_pitch;
+
+		los.gimbal_roll =
+			target_los.gimbal_roll;
+
+		// ============================================================
+		// 目标有效状态
+		// ============================================================
+
+		los.target_valid =
+			(target_los.target_valid != 0);
+
+		_vehicle_target_los_pub.publish(los);
+
+		break;
 	}
 #if !defined(CONSTRAINED_FLASH)
 

@@ -274,6 +274,13 @@ set(msg_files
 	versioned/VtolVehicleStatus.msg
 	versioned/Wind.msg
 	VehicleGuidanceAcceleration.msg
+	Cgtd070Status.msg
+	PnGuidanceLosDiag.msg
+	PnGuidanceGuidanceDiag.msg
+	PnGuidanceControlDiag.msg
+	PnGuidancePredictionDiag.msg
+	PnGuidanceRateEstimatorDiag.msg
+	Cgtd070Diag.msg
 )
 list(SORT msg_files)
 

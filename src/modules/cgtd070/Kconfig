@@ -1,0 +1,5 @@
+menuconfig MODULES_CGTD070
+    bool "cgtd070"
+    default n
+    ---help---
+        Enable the CGTD070 gimbal UART protocol application.

@@ -168,6 +168,13 @@ void LoggedTopics::add_default_topics()
 	add_topic_multi("timesync_status", 1000, 3);
 	add_optional_topic_multi("telemetry_status", 1000, 4);
 
+	add_topic("pn_guidance_los_diag");
+	add_topic("pn_guidance_guidance_diag");
+	add_topic("pn_guidance_control_diag");
+	add_topic("cgtd070_status");
+	add_topic("pn_guidance_prediction_diag");
+	add_topic("pn_guidance_rate_estimator_diag");
+	add_topic("cgtd070_diag", 100);
 	// EKF multi topics
 	{
 		// optionally log all estimator* topics at minimal rate
