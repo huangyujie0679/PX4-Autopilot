@@ -18,6 +18,7 @@ enum class Command : uint8_t {
     Idle = 0x00U,
     CancelTracking = 0x3BU,
     Center = 0x71U,
+    YawFollowAircraft = 0x7BU,
     GreenBoxTracking = 0x93U,
 };
 
@@ -59,6 +60,14 @@ struct FlightTelemetry {
     float gps_altitude_m;
     uint16_t battery_decivolt;
     uint16_t relative_height_decimeter;
+};
+
+// Protocol table 5, control-frame bytes 38..42. Rates are integer degrees
+// per second and are constrained by the packer to the documented range.
+struct JoystickControl {
+    uint8_t enabled;
+    int16_t azimuth_rate_dps;
+    int16_t pitch_rate_dps;
 };
 
 struct Telemetry {

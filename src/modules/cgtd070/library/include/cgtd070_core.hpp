@@ -33,6 +33,13 @@ public:
         uint8_t output[kControlFrameSize],
         const FlightTelemetry &telemetry) noexcept;
 
+    // Same frame with protocol-table-5 joystick control in bytes 38..42.
+    // enabled=0 forces both rates to zero and exits manual-search mode.
+    void build_next_tx_frame(
+        uint8_t output[kControlFrameSize],
+        const FlightTelemetry &telemetry,
+        const JoystickControl &joystick) noexcept;
+
     const ParserStats &stats() const noexcept { return stats_; }
     DecodeError last_error() const noexcept { return last_error_; }
     size_t buffered_bytes() const noexcept { return rx_used_; }

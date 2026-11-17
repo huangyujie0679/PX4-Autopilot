@@ -5,7 +5,6 @@
 #include <uORB/Subscription.hpp>
 #include <uORB/topics/battery_status.h>
 #include <uORB/topics/cgtd070_status.h>
-#include <uORB/topics/cgtd070_diag.h>
 #include <uORB/topics/home_position.h>
 #include <uORB/topics/manual_control_setpoint.h>
 #include <uORB/topics/sensor_gps.h>
@@ -35,31 +34,36 @@ public:
 
 private:
     static constexpr uint64_t kTxIntervalUs = 40000U;
-    static constexpr uint64_t kDiagIntervalUs = 100000U; // 10 Hz
     static constexpr int kMaxPollTimeoutMs = 20;
     static constexpr int kTaskStackSize = 4096;
+    static constexpr uint8_t kJoystickRequestMove = 1U;
+    static constexpr uint8_t kJoystickRequestStop = 2U;
+    static constexpr uint8_t kJoystickMailboxWriting = 0xFFU;
 
     static bool parse_config(int argc, char *argv[], Config &config) noexcept;
     bool open_serial() noexcept;
     bool queue_command(cgtd070::Command command) noexcept;
+    bool queue_joystick_request(uint8_t request,
+                                int16_t azimuth_rate_dps,
+                                int16_t pitch_rate_dps,
+                                uint32_t duration_ms) noexcept;
     void service_rx() noexcept;
     void prepare_tx_if_due(uint64_t now) noexcept;
     void service_tx() noexcept;
-    void trace_completed_command_frame() const noexcept;
+    void trace_completed_command_frame() noexcept;
     int poll_timeout_ms(uint64_t now) const noexcept;
     void update_flight_sources() noexcept;
     void update_rc_control(uint64_t now) noexcept;
     void reset_rc_state() noexcept;
+    void disarm_rc_manual() noexcept;
     cgtd070::FlightTelemetry make_flight_telemetry(uint64_t now) const noexcept;
     void process_feedback(const cgtd070::Feedback &feedback) noexcept;
     void update_parser_snapshot() noexcept;
-    void publish_diag(uint64_t now) noexcept;
 
     Config config_;
     cgtd070::Core core_;
     cgtd070::SerialDriver serial_;
     uORB::Publication<cgtd070_status_s> status_pub_{ORB_ID(cgtd070_status)};
-    uORB::Publication<cgtd070_diag_s> diag_pub_{ORB_ID(cgtd070_diag)};
     uORB::Subscription attitude_sub_{ORB_ID(vehicle_attitude)};
     uORB::Subscription gps_sub_{ORB_ID(sensor_gps)};
     uORB::Subscription battery_sub_{ORB_ID(battery_status)};
@@ -88,10 +92,24 @@ private:
     uint32_t rc_center_status_;
     uint32_t rc_commands_;
     uint32_t rc_command_busy_;
+    int8_t rc_azimuth_knob_state_;
+    int8_t rc_pitch_knob_state_;
+    uint8_t rc_manual_armed_;
+    cgtd070::JoystickControl rc_joystick_control_;
+    int32_t rc_aux4_milli_;
+    int32_t rc_aux5_milli_;
+    int32_t rc_azimuth_knob_status_;
+    int32_t rc_pitch_knob_status_;
+    uint32_t rc_manual_armed_status_;
 
     uint8_t tx_buffer_[cgtd070::kControlFrameSize];
     size_t tx_offset_;
     uint64_t next_tx_us_;
+    cgtd070::JoystickControl joystick_control_;
+    uint64_t joystick_end_us_;
+    uint8_t trace_joystick_enabled_;
+    int16_t trace_joystick_azimuth_rate_;
+    int16_t trace_joystick_pitch_rate_;
 
     // Written by the module Task and read by NSH status. Atomic builtins avoid
     // data races without STL, mutexes, or additional dynamic allocation.
@@ -111,13 +129,15 @@ private:
     uint32_t feedback_status_secondary_;
     uint32_t feedback_servo_state_;
     uint8_t command_mailbox_;
+    int32_t joystick_azimuth_mailbox_;
+    int32_t joystick_pitch_mailbox_;
+    uint32_t joystick_duration_ms_mailbox_;
+    uint8_t joystick_mailbox_state_;
+    uint32_t joystick_active_status_;
+    int32_t joystick_azimuth_status_;
+    int32_t joystick_pitch_status_;
+    uint32_t joystick_remaining_ms_status_;
+    uint32_t joystick_source_status_;
     uint8_t have_feedback_;
     uint8_t trace_enabled_;
-
-    // ULog diagnostic state. These are used only by the cgtd070 Task.
-    uint32_t telemetry_frames_;
-    uint64_t last_rx_byte_time_;
-    uint64_t last_parsed_frame_time_;
-    uint64_t last_telemetry_time_;
-    uint64_t last_diag_publish_time_;
 };

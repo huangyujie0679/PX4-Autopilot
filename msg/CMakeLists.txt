@@ -281,6 +281,7 @@ set(msg_files
 	PnGuidancePredictionDiag.msg
 	PnGuidanceRateEstimatorDiag.msg
 	Cgtd070Diag.msg
+	PnGuidanceObserverDiag.msg
 )
 list(SORT msg_files)
 

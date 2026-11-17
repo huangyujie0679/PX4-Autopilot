@@ -5,7 +5,6 @@
 namespace cgtd070 {
 namespace {
 
-
 uint16_t read_u16_le(const uint8_t *data) noexcept
 {
     return static_cast<uint16_t>(data[0]) |
@@ -45,6 +44,17 @@ void put_i16_le(uint8_t *data, int16_t value) noexcept
     put_u16_le(data, static_cast<uint16_t>(value));
 }
 
+int16_t constrain_joystick_rate(int16_t value) noexcept
+{
+    if (value < -100) {
+        return -100;
+    }
+    if (value > 100) {
+        return 100;
+    }
+    return value;
+}
+
 void put_f32_le(uint8_t *data, float value) noexcept
 {
     uint32_t bits = 0U;
@@ -62,6 +72,7 @@ bool valid_command(Command command) noexcept
     case Command::Idle:
     case Command::CancelTracking:
     case Command::Center:
+    case Command::YawFollowAircraft:
     case Command::GreenBoxTracking:
         return true;
     }
@@ -134,12 +145,22 @@ bool Core::request_command(Command command) noexcept
 void Core::build_next_tx_frame(uint8_t output[kControlFrameSize]) noexcept
 {
     const FlightTelemetry telemetry{};
-    build_next_tx_frame(output, telemetry);
+    const JoystickControl joystick{};
+    build_next_tx_frame(output, telemetry, joystick);
 }
 
 void Core::build_next_tx_frame(
     uint8_t output[kControlFrameSize],
     const FlightTelemetry &telemetry) noexcept
+{
+    const JoystickControl joystick{};
+    build_next_tx_frame(output, telemetry, joystick);
+}
+
+void Core::build_next_tx_frame(
+    uint8_t output[kControlFrameSize],
+    const FlightTelemetry &telemetry,
+    const JoystickControl &joystick) noexcept
 {
     if (output == nullptr) {
         return;
@@ -169,7 +190,13 @@ void Core::build_next_tx_frame(
     put_u16_le(output + 33U, telemetry.battery_decivolt);// bytes 34..35
     put_u16_le(output + 35U,
                telemetry.relative_height_decimeter);    // bytes 36..37
-    // Bytes 38..42 are the disabled joystick command and remain zero.
+    if (joystick.enabled != 0U) {
+        output[37] = 0x70U;                              // byte 38
+        put_i16_le(output + 38U,
+                   constrain_joystick_rate(joystick.azimuth_rate_dps));
+        put_i16_le(output + 40U,
+                   constrain_joystick_rate(joystick.pitch_rate_dps));
+    }
     output[42] = control_checksum(output);
     output[43] = kFrameTail;
     pending_command_ = Command::Idle;

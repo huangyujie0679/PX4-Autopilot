@@ -5,7 +5,7 @@
  * 统一vehicle_target_los语义：gimbal_roll是历史字段名，实际承载云台方位角(azimuth)，gimbal_pitch为俯仰角；los_azimuth/elevation为光轴脱靶角；los_az_rate/el_rate为RK3576由相邻图像帧目标像素差换算得到的相机相对LOS角速度。
  * 同一PN代码同时用于SITL与真机：SITL旧发送器若gimbal_*保持0，新的完整LOS公式会严格退化为旧版仅使用los_azimuth/elevation的几何。
  *
- * 状态机（V21.2航拍跟随直接BPN）：
+ * 状态机（V21.3航拍跟随直接BPN）：
  *
  * WAIT_LOS
  *    ↓
@@ -15,12 +15,16 @@
  *    ↓ ARM
  * WAIT_RELEASE
  *    ↓ RC AUX1 LOW->HIGH (100ms)
+ * LAUNCH_CLEARANCE
+ *    ↓
+ * TRANSITION
+ *    ↓
  * BPN ACTIVE
  *    ↓ 目标已越过 / LOS丢失
  * SAFE_HOVER
  *
  * LAUNCH_CLEARANCE / TRANSITION 的枚举、参数和函数继续保留用于回退/对照，
- * 但 DIRECT_BPN_AFTER_RELEASE=true 时正式飞行路径不再进入这两个阶段。
+ * V21.5将 DIRECT_BPN_AFTER_RELEASE=false，正式飞行路径重新进入这两个阶段。
  *
  * 本版本相对上一版的主要修改：
  *
@@ -28,12 +32,13 @@
  *
  * 1. 制导循环固定 50 Hz：LOOP_INTERVAL_US = 20000。
  *
- * 2. 正常速度规划改为：
- *      LOS rate <= 0.05 rad/s -> 26 m/s
- *      0.05 ~ 0.15          -> 26 -> 24 m/s
- *      0.15 ~ 0.30          -> 24 -> 21 m/s
- *      >= 0.30               -> 18 m/s
- *    28 m/s作为高速保护阈值，不再出现原代码26 -> 40 m/s的反向插值。
+ * 2. 当前速度规划（V21.3连续化）：
+ *      LOS rate <= 0.05 rad/s -> 25 m/s
+ *      0.05 ~ 0.15          -> 25 -> 24 m/s
+ *      0.15 ~ 0.35          -> 24 -> 22 m/s
+ *      0.35 ~ 0.60          -> 22 -> 20 m/s
+ *      >= 0.60               -> 20 m/s
+ *    26 m/s开始硬速度制动，28 m/s为当前名义硬速度保护上限。
  *
  * 3. 增强超速制动：
  *    - 超过动态目标速度后主动制动；
@@ -78,8 +83,8 @@
  *     - RC输入失效/超时后释放互锁复位，恢复后必须重新LOW->HIGH；
  *     - RELEASE真正触发前再次检查LOS、姿态以及本地Z/VZ有效，保证高度保护参考可建立；V21.2默认随后直接进入BPN ACTIVE。
  *
- * 12. RELEASE瞬间CLEARANCE_START_THRUST由0.80提高为0.90；
- *     CLEARANCE最大推力预算仍为0.95，高度保护从LAUNCH_CLEARANCE开始并持续覆盖TRANSITION/BPN。
+ * 12. 历史版本曾调整CLEARANCE起始推力；V21.7当前真机实飞基线以实际常量为准：start=0.25、limit=0.30。
+ *     高度保护仍从LAUNCH_CLEARANCE开始并持续覆盖TRANSITION/BPN。
  *
  * 13. V12在pn_guidance内部完成惯性LOS方向导数重构：
  *     - RK3576的los_az_rate/el_rate只按“图像相对角速度”解释，不再假设上游已惯性化；
@@ -202,7 +207,7 @@
  *     - RIG日志中的Braw继续表示未缩放BPN，Buse与_last_bpn_scale反映Stage3最终实际使用的缩放结果。
  *
  * 27. 【V21.2修改】航拍跟随正式飞行改为RELEASE后直接进入BPN ACTIVE：
- *     - 新增DIRECT_BPN_AFTER_RELEASE=true；LAUNCH_CLEARANCE/TRANSITION代码完整保留但正式路径不再进入；
+ *     - V21.2曾启用DIRECT_BPN_AFTER_RELEASE=true；V21.5现已回退为false，恢复LAUNCH_CLEARANCE/TRANSITION正式路径；
  *     - 新增enter_bpn_active()，在直接接管前重新以当前真实姿态初始化slew基准，并保留RELEASE高度底线保护基准；
  *     - 不增加BPN gain ramp：AUX1 RELEASE通过后，同一控制周期直接运行完整BPN（方案A）；
  *     - 因不再有CLEARANCE/TRANSITION等待窗口，真机RELEASE额外要求LOS-rate observer有效且body-rate新鲜；
@@ -210,10 +215,114 @@
  *     - PN_N、BPN_ACCEL_MAX、AXIAL_ACCEL_MAX、FLIGHT_COMMISSIONING_GAIN、速度规划/制动参数均保持原值；
  *     - 将法向BPN、轴向加速度、Vc、速度规划、推力预算等调参量集中标注，并在status中显式打印，便于航拍跟随调参。
  *
+ * 28. 【V21.3修改】保持直接BPN和现有BPN增益不变，仅修正二代机参数自洽性与速度规划连续性：
+ *     - HOVER_THRUST确认采用实测0.15；不新增velocity_valid() RELEASE硬门槛；
+ *     - ALT_FLOOR_THRUST_LIMIT改为与GUIDANCE_THRUST_LIMIT相同，避免高度保护介入时最大推力预算反而下降；
+ *     - 新增LOS_RATE_SPEED_POINT_4=0.60 rad/s，在0.35~0.60 rad/s区间把目标速度由13 m/s连续插值到6 m/s；
+ *     - 0.60 rad/s以上保持GUIDANCE_SPEED_MIN=6 m/s，消除原0.35 rad/s处13->6 m/s阶跃；
+ *     - PN_N、BPN_ACCEL_MAX、AXIAL_ACCEL_MAX、FLIGHT_COMMISSIONING_GAIN、speed brake、姿态限制和高度保护算法其余参数均不改。
+ *
+ * 29. 【V21.4修改】增加RC绝对优先级与多publisher防竞争仲裁：
+ *     - 识别PX4 Manual/Stabilized姿态模式：manual=true且altitude/velocity/position=false；
+ *       该模式下mc_att_control会由遥控器直接生成vehicle_attitude_setpoint，因此pn_guidance硬禁止发布同一topic；
+ *     - RELEASE进入正式制导时锁存当前vehicle_status.nav_state；制导激活后只要飞行模式发生变化，
+ *       或进入Manual/Stabilized姿态模式，立即锁存RC_OVERRIDE并停止pn_guidance所有姿态setpoint发布；
+ *     - RC_OVERRIDE在本次ARM周期内保持锁存，绝不因模式抖动/短时切回而自动重新夺权；只有DISARM后清除；
+ *     - RELEASE若当前已经处在Manual/Stabilized姿态模式则拒绝，必须先切回制导所用模式并重新AUX1 LOW->HIGH；
+ *     - publish_attitude_setpoint_internal()增加最终防线，即使其它状态路径遗漏仲裁，也不能在RC拥有姿态控制权时发布；
+ *     - RIG固定台架路径和DISARMED接口测试不受该正式飞行RC仲裁影响。
+ * 30. 【V21.5修改】恢复正式发射状态机：WAIT_RELEASE -> LAUNCH_CLEARANCE -> TRANSITION -> BPN。
+ *     仅把DIRECT_BPN_AFTER_RELEASE切回false；保留V21.4 RC绝对优先级/多publisher防竞争仲裁不变。
+ *     用于A/B验证“RELEASE后直接BPN”是否与偶发调度拥塞存在相关性。
+ * 31. 【V21.6修改】仅缩短发射缓冲时间：CLEARANCE=0.20s（0.10s ramp+0.10s hold），TRANSITION=0.20s；
+ *     加上AUX1 HIGH的100ms RELEASE确认，从物理拨杆HIGH到正式BPN约0.50s；其余推力、BPN、姿态限制参数保持不变。
+ * 32. 【V21.7修改】针对实飞云台瞬时掉锁与过渡期机体角速度过大：
+ *     - 真机CLEARANCE改为100ms保持RELEASE瞬间姿态，不再在CLEARANCE内主动把姿态拉向近水平；
+ *     - TRANSITION改为300ms，因此无掉锁时仍保持AUX1 HIGH确认100ms + CLEARANCE100ms + TRANSITION300ms ≈ 0.50s进入正式BPN；
+ *     - CLEARANCE/TRANSITION专用姿态lead限制分别为8deg与8->10deg，正式BPN仍恢复45deg；
+ *     - control LOS/target_valid短暂无效增加250ms宽限，期间保持最后一帧有效制导指令；CLEARANCE/TRANSITION计时暂停，重捕后从原进度继续；
+ *     - 连续无效超过250ms或LOS数据真正stale时仍进入SAFE_HOVER，不自动从SAFE_HOVER重入BPN。
+ * 33. 【V21.8修改】将正式BPN速度规划提升到20~25m/s，并同步提高高速段法向机动能力：
+ *     - speed target改为25/24/22/20m/s，名义hard limit改为28m/s，26m/s开始硬制动；
+ *     - VC_MAX由15提高到25m/s，使有效EKF闭合速度不再被15m/s截断；VC_FALLBACK保持20m/s；
+ *     - BPN_ACCEL_MAX由10提高到12m/s^2，PN_N=3.0与FLIGHT_COMMISSIONING_GAIN=1.0保持不变；
+ *     - AXIAL_ACCEL_MAX保持5m/s^2；正常speed brake最大6m/s^2，hard brake最大8m/s^2；
+ *     - V21.7的0.5s过渡、250ms掉锁宽限与过渡期lead限制全部保持不变。
+ * 34. 【V21.9修改】补齐20~25m/s高速版的速度失效降级与RC Acro接管：
+ *     - VC_FALLBACK改为15m/s，VC_MAX仍为25m/s；有效EKF速度参与正常Vc闭环，无效时BPN按15m/s保守fallback；
+ *     - SPEED_ACCEL_TAPER_BAND由2m/s扩大到4m/s，目标速度前4m/s开始逐渐收掉轴向加速度；
+ *     - EKF三维速度无效时，正式制导AXIAL上限自动从5降到3m/s^2；速度恢复有效后自动回到5m/s^2并继续按速度目标taper；
+ *     - RC所有权识别扩展到Manual/Stabilized/Acro：manual+rates且无alt/vel/pos控制时均视为飞手接管；
+ *     - RELEASE后RC override监控持续覆盖SAFE_HOVER，不再只在CLEARANCE/TRANSITION/BPN生效；一旦切人工模式或nav_state变化即锁存到DISARM；
+ *     - V21.8的25/24/22/20m/s速度目标、BPN_MAX=12、28m/s硬上限及V21.7过渡/掉锁保护全部保持。
+ * 35. 【V21.9.1修改】仅做两项小改动，保持v21.9其余正式飞行逻辑/参数完全不变：
+ *     - AUX1 HIGH通过100ms确认且RELEASE全部guard通过后，在真正进入CLEARANCE/BPN前，用当前vehicle_attitude重新锁定_yaw_lock；
+ *       避免WAIT_LOS早期锁定的旧航向与实际RELEASE航向相差较大，引发无意义的大幅偏航并增加云台补偿压力。
+ *     - TARGET_LOSS_GRACE_US由150ms增加到250ms；短时target/control LOS失效期间仍保持最后一帧有效制导指令，
+ *       其余LOS_REACQUIRE_GRACE、CLEARANCE/TRANSITION、PN/BPN/AXIAL、速度规划、姿态限制和高度保护全部不变。
+ * 36. 【V21.9.2修改】基于2026-10-31实飞日志的小步响应调整：
+ *     - VC_FALLBACK由15m/s降为10m/s，仅在EKF三维速度无效时降低BPN闭合速度估计；VC_MAX仍为25m/s；
+ *     - CLEARANCE_ATTITUDE_SLEW_DEG_S由75提高到85deg/s；
+ *     - GUIDANCE_ATTITUDE_SLEW_DEG_S由75提高到85deg/s；
+ *     - GUIDANCE_ATTITUDE_LEAD_MAX_DEG保持65deg不变；PN_N、BPN_ACCEL_MAX、AXIAL、速度规划、状态机和推力预算均不改。
+ * 37. 【V21.10修改】针对真机约125ms LOS相位滞后增加当前时刻预测：
+ *     - 真机direct miss angle仍严格按capture_time=RX-100ms解释，不伪造视觉时间戳；
+ *     - IMG miss-rate由原capture-20ms中心差分改为capture时刻三点后向二阶差分，去掉人为增加的20ms observer滞后；
+ *     - observer_time改为capture_time，GIM仍利用已存在的RX历史在capture±40ms做中心差分，BODY gyro与IMG/GIM保持同一capture时刻；
+ *     - 利用body-rate历史把capture时刻的LOS与惯性LOS角速度传播到当前Body坐标，再按恒定惯性LOS角速度模型外推到now；
+ *     - 正式BPN、Vc投影和CLEARANCE使用同一份current-time预测LOS，避免BPN用预测LOS但Vc仍用历史LOS；
+ *     - 预测测量年龄上限提高到170ms，body-rate历史保持64帧；历史不足/预测失败时正式真机控制返回invalid，由现有BPN invalid/重捕获/target-loss安全路径处理，不回退混用旧时基。
+ *     - V21.13保持VC_FALLBACK=10、lead=65deg、PN_N=3、BPN_MAX=12和状态机；slew提高为95deg/s，LOS-rate LPF为10ms。
+ * 39. 【V21.12修改】增加完整LOS离散shadow observer（仅诊断，不参与正式控制）：
+ *     - 正式IMG miss-rate由三点后向差分升级为6点因果二次最小二乘端点导数；只使用当前/历史帧，不等待未来帧；
+ *     - 重捕获初期历史不足6帧时自动回退原三点后向二阶差分，避免额外增加约100ms重新建立时间；
+ *     - IMG+GIM+BODY融合后的最终LOS-rate LPF由25ms减到10ms；该组合已用两份实飞日志做capture->now端到端回放验证；
+ *     - 完整LOS离散shadow observer直接比较连续两帧完整LOS单位向量：先用gyro历史把上一帧LOS传播到当前Body时刻，再用球面最短旋转求惯性LOS-rate；
+ *     - shadow observer不参与正式控制，只做12ms低通并用相同capture->now预测模型生成shadow predicted LOS；
+ *     - 新增pn_guidance_observer_diag，50Hz记录formal/shadow LOS-rate、两者夹角、两套predicted LOS、正式/旧三点miss-rate以及估计器模式；
+ *     - 本版不改变PN_N、BPN_MAX、速度规划、slew、lead、IMU速度回退、target-loss grace或状态机。
+ *
+ * 38. 【V21.11修改】增加EKF速度失效时的短时IMU惯导速度回退：
+ *     - 订阅vehicle_acceleration（FRD Body，比力/加速度，含重力项），用姿态旋到NED后加g补偿得到惯性加速度；
+ *     - EKF三维速度有效时每周期把IMU积分速度重新锚定到EKF速度，防止长期漂移；
+ *     - 若起飞前EKF速度已无效，则在未RELEASE/WAIT_RELEASE静止阶段持续以0m/s锚定，RELEASE后再开始积分；
+ *     - V22.01固定翼分支将EKF无效后的纯IMU积分上限设为6s；超过时限后Vc与轴向能力平滑退化，避免硬切换；
+ *     - 正式Vc投影、动态速度目标taper、正常speed brake和越靶速度门槛优先使用EKF，否则使用短时IMU速度；
+ *     - SAFE_HOVER只允许IMU速度参与短时制动，不用IMU积分位置做位置保持；其余状态机、BPN、LOS预测、姿态限制不变。
+ *
  ****************************************************************************/
 
-// 【V20.9修改】更新构建标识，便于刷机后确认已使用“固定100ms视觉延迟+云台历史中心差分”版本。
-#define PN_GUIDANCE_BUILD_TAG "v21.2-direct-bpn-hover009-20261027"
+// V22.04: fixed-wing tracking adaptive-BPN-jerk / slew110 derived from V22.03.
+// Keeps V22.02 LOS/BPN/thrust shaping, but releases acceleration and attitude authority progressively after RELEASE.
+/*
+ * V22.03 (2026-11-05) -- fixed-wing tracking / gimbal-protection launch scheduling:
+ *  - Keep V22.02: Vt_NED=[0,0,0], 4Hz LOS-rate notch, NED BPN jerk limit=60m/s^3,
+ *    final-q vertical-support-priority thrust sync, 6s IMU fallback and smooth velocity-source degradation.
+ *  - Add a 1.5s gimbal-protection window measured from accepted RELEASE (not from BPN entry).
+ *  - During that window, axial acceleration cap is smoothstep-ramped from 3.5 to the normal 6.5m/s^2.
+ *  - Lateral BPN authority is smoothstep-ramped from 0.75 to 1.00 before the existing NED jerk limiter.
+ *  - Attitude-setpoint slew cap is smoothstep-ramped from 80 to the normal 105deg/s.
+ *    This indirectly limits initial body-rate demand while the stabilized gimbal is acquiring the post-launch motion.
+ *  - The existing CLEARANCE/TRANSITION state machine is retained; the protection window spans those states and
+ *    naturally continues into early BPN, reaching full authority 1.5s after RELEASE.
+ *  - Keep PN_N=3, BPN_ACCEL_MAX=12m/s^2, lead=65deg, max tilt=75deg and thrust budgets unchanged.
+
+ *
+ * V22.04 (2026-11-05) -- adaptive BPN jerk + 110deg/s full slew:
+ *  - Replace fixed 60m/s^3 BPN jerk limit with LOS-rate adaptive jerk:
+ *      <=0.12rad/s: 90m/s^3;
+ *      0.12~0.30rad/s: 90->160m/s^3;
+ *      0.30~0.50rad/s: 160->240m/s^3;
+ *      >=0.50rad/s: 240m/s^3.
+ *  - If raw-vs-shaped BPN direction error exceeds 35deg, add up to 25% catch-up boost
+ *    by 75deg error; absolute cap 300m/s^3. At 50Hz this allows up to 6.0m/s^2
+ *    BPN-vector change per cycle only in severe terminal mismatch.
+ *  - Full guidance/clearance slew increases 105->110deg/s. V22.03 1.5s gimbal-protect
+ *    ramp remains 80deg/s -> 110deg/s.
+ *  - Keep 4Hz LOS-rate notch, 6.5m/s^2 axial cap, vertical-priority thrust sync,
+ *    Vt=[0,0,0], EKF/IMU fallback logic, and all safety/state-machine logic unchanged.
+*/
+#define PN_GUIDANCE_BUILD_TAG "v22.06-gimbal-load-supervisor-yawreset-guard-20261106"
 
 #include <px4_platform_common/module.h>
 #include <px4_platform_common/module_params.h>
@@ -230,6 +339,7 @@
 
 #include <uORB/topics/vehicle_attitude.h>
 #include <uORB/topics/vehicle_angular_velocity.h>
+#include <uORB/topics/vehicle_acceleration.h>
 #include <uORB/topics/vehicle_attitude_setpoint.h>
 #include <uORB/topics/vehicle_local_position.h>
 #include <uORB/topics/vehicle_status.h>
@@ -246,6 +356,7 @@
 #include <uORB/topics/pn_guidance_los_diag.h>
 #include <uORB/topics/pn_guidance_guidance_diag.h>
 #include <uORB/topics/pn_guidance_control_diag.h>
+#include <uORB/topics/pn_guidance_observer_diag.h>
 #include <uORB/topics/debug_vect.h>
 
 #include <matrix/matrix/math.hpp>
@@ -459,26 +570,37 @@ The module publishes vehicle_attitude_setpoint directly.
 			 (int)DIRECT_BPN_AFTER_RELEASE,
 			 DIRECT_BPN_AFTER_RELEASE ? "BPN_ACTIVE" : "LAUNCH_CLEARANCE",
 			 DIRECT_BPN_AFTER_RELEASE ? "BYPASSED" : "ENABLED");
+		const uint64_t status_now_rc = hrt_absolute_time();
+		PX4_INFO("RC_AUTH override=%d rc_manual_owner=%d nav_base=%s%u nav_now=%u; override clears only on DISARM",
+			 (int)_rc_override_latched,
+			 (int)rc_manual_attitude_owner_active(status_now_rc),
+			 _guidance_release_nav_state_valid ? "" : "invalid/",
+			 (unsigned)_guidance_release_nav_state,
+			 (unsigned)_vehicle_status.nav_state);
 		PX4_INFO("BPN TUNE lateral: PN_N=%.2f BPN_MAX=%.2f m/s^2 flight_gain=%.2f",
 			 (double)PN_N, (double)BPN_ACCEL_MAX, (double)FLIGHT_COMMISSIONING_GAIN);
-		PX4_INFO("BPN TUNE axial: AXIAL_MAX=%.2f m/s^2 taper=%.2f m/s speed=%.1f/%.1f/%.1f/%.1f hard=%.1f",
-			 (double)AXIAL_ACCEL_MAX, (double)SPEED_ACCEL_TAPER_BAND,
+		PX4_INFO("BPN TUNE axial: AXIAL_MAX=%.2f degraded_no_vel=%.2f m/s^2 taper=%.2f m/s speed=%.1f/%.1f/%.1f/%.1f hard=%.1f",
+			 (double)AXIAL_ACCEL_MAX, (double)AXIAL_ACCEL_DEGRADED_NO_VEL, (double)SPEED_ACCEL_TAPER_BAND,
 			 (double)GUIDANCE_SPEED_CRUISE, (double)GUIDANCE_SPEED_MID_1,
 			 (double)GUIDANCE_SPEED_MID_2, (double)GUIDANCE_SPEED_MIN,
 			 (double)GUIDANCE_SPEED_HARD_LIMIT);
 		PX4_INFO("BPN TUNE thrust: hover=%.3f min=%.3f guidance_limit=%.2f alt_floor_limit=%.2f max=%.2f",
 			 (double)HOVER_THRUST, (double)MIN_THRUST,
 			 (double)GUIDANCE_THRUST_LIMIT, (double)ALT_FLOOR_THRUST_LIMIT, (double)MAX_THRUST);
-		PX4_INFO("LEGACY CLEARANCE disabled_when_direct=1 start_thr=%.2f limit=%.2f ramp=%.2fs hold=%.2fs transition=%.2fs",
+		PX4_INFO("V21.7 CLEARANCE hw_hold=%.2fs start_thr=%.2f limit=%.2f; TRANSITION=%.2fs",
+			 (double)(HW_CLEARANCE_HOLD_DURATION_US * 1e-6f),
 			 (double)CLEARANCE_START_THRUST, (double)CLEARANCE_THRUST_LIMIT,
-			 (double)(CLEARANCE_RAMP_DURATION_US * 1e-6f),
-			 (double)(CLEARANCE_HOLD_DURATION_US * 1e-6f),
 			 (double)(TRANSITION_DURATION_US * 1e-6f));
+		PX4_INFO("ATT slew=%.1fdeg/s lead clearance=%.1f transition=%.1f->%.1f bpn=%.1fdeg max_tilt=%.1fdeg target_grace=%ums",
+			 (double)GUIDANCE_ATTITUDE_SLEW_DEG_S,
+			 (double)CLEARANCE_ATTITUDE_LEAD_MAX_DEG,
+			 (double)TRANSITION_ATTITUDE_LEAD_START_DEG,
+			 (double)TRANSITION_ATTITUDE_LEAD_END_DEG,
+			 (double)GUIDANCE_ATTITUDE_LEAD_MAX_DEG,
+			 (double)GUIDANCE_THRUST_VECTOR_MAX_TILT_DEG,
+			 (unsigned)(TARGET_LOSS_GRACE_US / 1000ULL));
 
-		PX4_INFO("ATT slew max=%.1f deg/s", (double)GUIDANCE_ATTITUDE_SLEW_DEG_S);
-		PX4_INFO("ATT lead max=%.1f deg", (double)GUIDANCE_ATTITUDE_LEAD_MAX_DEG);
-
-		PX4_INFO("PN N=%.2f Vc EKF LOS projection", (double)PN_N);
+		PX4_INFO("PN N=%.2f fixed-wing UNKNOWN Vt: control Vc_est=Va.LOS with EKF/IMU aircraft velocity", (double)PN_N);
 		PX4_INFO("FLIGHT commissioning gain=%.2f (TRANSITION/BPN normal BPN only)", (double)FLIGHT_COMMISSIONING_GAIN);
 		PX4_INFO("V20 MODE sitl=%d truth_control=%d hw_observer_only=%d control_publish=%d",
 			 (int)SIMULATION_MODE, (int)SIM_USE_TRUTH_LOS_CONTROL,
@@ -487,21 +609,26 @@ The module publishes vehicle_attitude_setpoint directly.
 			 SIMULATION_MODE ? "vehicle_target_los(SITL)" : "cgtd070_status(HW)",
 			 (int)LOS_INPUT_HAS_MISS_ANGLE, (unsigned)(TRUTH_LOS_TIMEOUT_US / 1000ULL));
 		// 【V21修改】状态页显示100ms capture补偿、miss中心差分额外20ms时基以及gyro/gimbal历史对齐状态。
-		PX4_INFO("V21 TIME LOSage=%.1fms capture=%.0fms miss_half=%.0fms gyro_err=%+.1fms ginterp=%d gim_err=%+.1fms gim_interp=%d",
+		PX4_INFO("V21.10 TIME LOSage=%.1fms capture=%.0fms miss_step=%.0fms gyro_err=%+.1fms ginterp=%d gim_err=%+.1fms gim_interp=%d",
 			 (double)(_last_los_sample_age_us * 1e-3f), (double)(VISION_FIXED_DELAY_US * 1e-3f),
-			 (double)(MISS_RATE_CENTER_HALF_WINDOW_US * 1e-3f),
+			 (double)(MISS_RATE_BACKWARD_STEP_US * 1e-3f),
 			 (double)(_last_body_rate_align_error_us * 1e-3f), (int)_last_body_rate_interpolated,
 			 (double)(_last_gimbal_align_error_us * 1e-3f), (int)_last_gimbal_interpolated);
 
 		PX4_INFO("LOS GEOM Camera->Body: Cx->+By Cy->-Bx Cz->-Bz; Guidance: Gx=-Cy Gy=Cx Gz=Cz; G->B: Gx->Bx Gy->By Gz->-Bz");
 		// 【V21修改】真机正式IMG rate来源改为PX4 direct-miss中心差分；RK3576 black-box rate仅ULog诊断。
-		PX4_INFO("LOS RATE HW=PX4-miss-center valid=%d board_rate=diag_only body_rate_fresh=%d",
-			 (int)_diag_miss_rate_valid, (int)body_rate_valid(hrt_absolute_time()));
-		// 【V21修改】IMG miss-rate总窗口40ms；GIM保持±40ms中心差分；最终25ms IN低通暂时保留。
-		PX4_INFO("V21 RATE fusion=IMGmissPX4+GIMcenter+omegaXLOS miss_win=%.0fms gim_half=%.0fms final_tau=%.0fms",
-			 (double)(2ULL * MISS_RATE_CENTER_HALF_WINDOW_US * 1e-3f),
+		PX4_INFO("LOS RATE HW=PX4-miss-poly6/back3 valid=%d mode=%u board_rate=diag_only body_rate_fresh=%d",
+			 (int)_diag_miss_rate_valid, (unsigned)_diag_miss_rate_mode, (int)body_rate_valid(hrt_absolute_time()));
+		// V21.12: IMG formal rate为poly6因果端点拟合（bootstrap时back3）；GIM保持capture±40ms中心差分；最终rate LPF=10ms。
+		PX4_INFO("V22.02 RATE fusion=IMGmissPoly6+GIMcenter+omegaXLOS gim_half=%.0fms tau=%.0fms + notch4Hz",
 			 (double)(GIMBAL_RATE_CENTER_HALF_WINDOW_US * 1e-3f),
 			 (double)(INERTIAL_LOS_RATE_LPF_TAU * 1000.f));
+		PX4_INFO("V21.13 PRED valid=%d age=%.1fms extra_lead=%ums horizon=%.1fms angle=%.2fdeg age_max=%ums body_hist=%u",
+			 (int)_los_prediction_valid, (double)(_los_prediction_age_us * 1e-3f),
+			 (unsigned)(_last_control_extra_lead_us / 1000ULL),
+			 (double)((_los_prediction_age_us + _last_control_extra_lead_us) * 1e-3f),
+			 (double)_los_prediction_angle_deg, (unsigned)(LOS_PREDICT_MAX_US / 1000ULL),
+			 (unsigned)BODY_RATE_HISTORY_LEN);
 		const uint64_t status_now = hrt_absolute_time();
 		const float last_cmd_age_ms = (_last_valid_guidance_cmd_time > 0 && status_now >= _last_valid_guidance_cmd_time)
 			? (status_now - _last_valid_guidance_cmd_time) * 1e-3f : 0.f;
@@ -524,6 +651,48 @@ The module publishes vehicle_attitude_setpoint directly.
 			 (double)VC_MAX,
 			 (double)VC_LPF_TAU_RISE,
 			 (double)VC_LPF_TAU_FALL);
+		PX4_INFO("V22.02 FIXED-WING target_vel=UNKNOWN comp=%d Vt_NED=[0 0 0]; Vc_est=Va.LOS",
+			 (int)TARGET_VELOCITY_COMPENSATION_ENABLED);
+		PX4_INFO("V22.04 shape: LOS_notch=%d f0=%.1fHz Q=%.1f adaptive_jerk=%.0f/%.0f/%.0f cap=%.0fm/s^3 current=%.1f dir_err=%.1fdeg full_slew=%.1fdeg/s",
+			 (int)LOS_RATE_NOTCH_ENABLED, (double)LOS_RATE_NOTCH_FREQ_HZ, (double)LOS_RATE_NOTCH_Q,
+			 (double)BPN_JERK_LOW, (double)BPN_JERK_MID, (double)BPN_JERK_HIGH, (double)BPN_JERK_ABS_MAX,
+			 (double)_last_bpn_jerk_limit, (double)_last_bpn_jerk_dir_error_deg,
+			 (double)GUIDANCE_ATTITUDE_SLEW_DEG_S);
+		PX4_INFO("V22.05 terminal: lead=%lums adaptive_slew=%.1fdeg/s centering=%.2fm/s^2 lead_cap=%lums slew_cap=%.1fdeg/s",
+			 (unsigned long)(_last_control_extra_lead_us / 1000ULL), (double)_last_adaptive_slew_deg_s,
+			 (double)_last_centering_assist_norm, (unsigned long)(LOS_CONTROL_EXTRA_LEAD_MAX_US / 1000ULL),
+			 (double)GUIDANCE_ATTITUDE_SLEW_HIGH_DEG_S);
+		PX4_INFO("V22.06 GIMBAL_LOAD state=%u risk=%.2f geo=%.2f dyn=%.2f ctrl=%.2f offaxis=%.1fdeg rate=%.1fdeg/s accel=%.0fdeg/s2 caps axial=%.2f slew=%.1f lead=%.1f",
+			 (unsigned)_gimbal_load_state, (double)_gimbal_load, (double)_gimbal_geometry_load,
+			 (double)_gimbal_dynamic_load, (double)_gimbal_control_load, (double)_gimbal_offaxis_deg,
+			 (double)_gimbal_rate_mag_deg_s, (double)_gimbal_accel_mag_filtered_deg_s2,
+			 (double)_gimbal_supervisor_axial_cap, (double)_gimbal_supervisor_slew_cap_deg_s,
+			 (double)_gimbal_supervisor_lead_cap_deg);
+		PX4_INFO("V22.06 ATT_RESET_GUARD active=%d last_angle=%.1fdeg remaining=%.0fms; recommended EKF2_MAG_TYPE=6 for HW test",
+			 (int)attitude_reset_guard_active(status_now), (double)_last_attitude_reset_angle_deg,
+			 (double)(attitude_reset_guard_active(status_now) ? (_attitude_reset_guard_until - status_now) * 1e-3f : 0.f));
+		PX4_INFO("V22.04 GIMBAL_PROTECT window=%.2fs phase=%.2f axial_cap=%.2f bpn_scale=%.2f slew_cap=%.1fdeg/s",
+			 (double)(GIMBAL_PROTECT_DURATION_US * 1e-6f), (double)_last_gimbal_protect_phase,
+			 (double)_last_gimbal_protect_axial_cap, (double)_last_gimbal_protect_bpn_scale,
+			 (double)_last_gimbal_protect_slew_deg_s);
+		PX4_INFO("V22.04 thrust_sync=FINAL_Q vertical-priority; axial=%.1f degraded=%.1f; vc_blend=%.2fs axial_blend=%.2fs",
+			 (double)AXIAL_ACCEL_MAX, (double)AXIAL_ACCEL_DEGRADED_NO_VEL,
+			 (double)VC_FALLBACK_BLEND_TAU, (double)AXIAL_DEGRADED_BLEND_TAU);
+		PX4_INFO("VEL SRC=%s EKF_valid=%d IMU_valid=%d IMU=%.2fm/s fallback_max=%.1fs accel_age=%.1fms",
+			 guidance_velocity_source_name(), (int)velocity_valid(), (int)imu_velocity_available(),
+			 (double)(imu_velocity_available() ? _imu_velocity_ned.norm() : NAN),
+			 (double)(IMU_VEL_FALLBACK_MAX_US * 1e-6f),
+			 (double)((_last_accel_rx_time > 0 && status_now >= _last_accel_rx_time) ? (status_now - _last_accel_rx_time) * 1e-3f : -1.f));
+		PX4_INFO("V21.14 EKF VEL GUARD active=%d blend=%d alpha=%.2f diff=%.2f hold=%.2fs blend_t=%.2fs max=%.2fs jump=%.1fm/s reacq=%.1fm/s",
+			 (int)_ekf_velocity_guard_active, (int)_ekf_velocity_blend_active,
+			 (double)_ekf_velocity_blend_alpha, (double)_last_ekf_imu_velocity_diff,
+			 (double)(EKF_RESET_IMU_HOLD_US * 1e-6f),
+			 (double)(EKF_RESET_BLEND_BACK_US * 1e-6f),
+			 (double)(EKF_RESET_GUARD_MAX_US * 1e-6f),
+			 (double)EKF_VEL_JUMP_TRIGGER_MPS, (double)EKF_REACQUIRE_MAX_DIFF_MPS);
+
+		PX4_INFO("EKF VEL GUARD force_reacquire_diff<=%.1fm/s; larger mismatch stays on IMU/fixed fallback",
+			 (double)EKF_REACQUIRE_FORCE_MAX_DIFF_MPS);
 
 		PX4_INFO("BPN_ACCEL_MAX=%.2f m/s^2", (double)BPN_ACCEL_MAX);
 
@@ -531,10 +700,11 @@ The module publishes vehicle_attitude_setpoint directly.
 			 (double)GUIDANCE_SPEED_CRUISE,
 			 (double)GUIDANCE_SPEED_HARD_LIMIT);
 
-		PX4_INFO("TERMINAL SPEED los_rate %.2f/%.2f/%.2f rad/s -> %.1f/%.1f/%.1f/%.1f m/s",
+		PX4_INFO("TERMINAL SPEED los_rate %.2f/%.2f/%.2f/%.2f rad/s -> %.1f/%.1f/%.1f/%.1f m/s",
 			 (double)LOS_RATE_SPEED_POINT_1,
 			 (double)LOS_RATE_SPEED_POINT_2,
 			 (double)LOS_RATE_SPEED_POINT_3,
+			 (double)LOS_RATE_SPEED_POINT_4,
 			 (double)GUIDANCE_SPEED_CRUISE,
 			 (double)GUIDANCE_SPEED_MID_1,
 			 (double)GUIDANCE_SPEED_MID_2,
@@ -613,6 +783,16 @@ private:
 		WAIT_RELEASE     = 6
 	};
 
+	// V22.06: supervisory state derived from gimbal off-axis angle, rate and angular acceleration.
+	// It is diagnostic/coordination state only; target_valid still comes from the vision/gimbal board.
+	enum class GimbalLoadState : uint8_t
+	{
+		NORMAL   = 0,
+		CAUTION  = 1,
+		HIGH     = 2,
+		CRITICAL = 3
+	};
+
 	// ============================================================
 	// 基本周期
 	// ============================================================
@@ -683,7 +863,8 @@ private:
 	static constexpr uint64_t TRUTH_LOS_TIMEOUT_US = 120000; // SITL truth 120 ms
 	static constexpr uint64_t V20_RESET_METRIC_WINDOW_US = 100000; // EKF reset后100ms误差单独统计
 	static constexpr float V20_METRIC_TRUTH_RATE_MAX = 0.50f; // 排除极近距离/越靶LOS几何奇异区
-	static constexpr uint8_t BODY_RATE_HISTORY_LEN = 32;
+	// V21.10: 64帧body-rate历史，为约100~120ms视觉预测提供足够旋转传播余量。
+	static constexpr uint8_t BODY_RATE_HISTORY_LEN = 64;
 	static constexpr uint64_t BODY_RATE_INTERP_MAX_GAP_US = 60000;
 	static constexpr uint64_t BODY_RATE_NEAREST_MAX_US = 30000;
 
@@ -701,14 +882,47 @@ private:
 	// 【V21修改】miss angle历史插值允许的最大相邻样本间隔与最近样本回退范围。
 	static constexpr uint64_t MISS_INTERP_MAX_GAP_US = 60000ULL;
 	static constexpr uint64_t MISS_NEAREST_MAX_US = 30000ULL;
-	// 【V21修改】PX4自行重构IMG角速度采用observer时刻前后各20ms中心差分，总窗口40ms。
+	// V21.10: direct miss仍以约20ms帧周期保存；正式IMG rate改为capture时刻三点后向二阶差分，
+	// 不再为了中心差分把observer额外退后20ms。该常量保留给诊断字段/旧工具兼容。
 	static constexpr uint64_t MISS_RATE_CENTER_HALF_WINDOW_US = 20000ULL;
+	static constexpr uint64_t MISS_RATE_BACKWARD_STEP_US = 20000ULL;
+	static constexpr uint8_t MISS_RATE_POLYFIT_POINTS = 6;
+
+	// V21.10: 只补偿已确认的视觉/observer历史时间，不允许对陈旧数据无限外推。
+	static constexpr uint64_t LOS_PREDICT_MAX_US = 170000ULL; // V21.13: allow nominal ~100-115ms age + ~2 missed 50Hz frames
+	// V22.05: after reconstructing LOS from capture time to "now", lead it a little further to account for
+	// the measured downstream attitude/rate/airframe response. This is dynamic, not a blind fixed 100ms lead.
+	static constexpr uint64_t LOS_CONTROL_EXTRA_LEAD_MIN_US = 35000ULL; // 35ms in calm geometry
+	static constexpr uint64_t LOS_CONTROL_EXTRA_LEAD_MID_US = 55000ULL; // ~55ms moderate LOS dynamics
+	static constexpr uint64_t LOS_CONTROL_EXTRA_LEAD_MAX_US = 80000ULL; // 80ms terminal cap
+	static constexpr uint64_t LOS_PREDICT_TOTAL_MAX_US = 250000ULL;     // age + extra lead hard cap
+	static constexpr float LOS_CONTROL_LEAD_RATE_P1 = 0.10f; // rad/s
+	static constexpr float LOS_CONTROL_LEAD_RATE_P2 = 0.25f; // rad/s
+	static constexpr float LOS_CONTROL_LEAD_RATE_P3 = 0.45f; // rad/s
+	static constexpr float LOS_CONTROL_LEAD_ATT_ERR_START_DEG = 6.0f;
+	static constexpr float LOS_CONTROL_LEAD_ATT_ERR_FULL_DEG = 18.0f;
+	static constexpr uint64_t LOS_CONTROL_LEAD_ATT_BOOST_MAX_US = 15000ULL; // +15ms when attitude is lagging
+	static constexpr uint64_t LOS_PREDICT_INTEGRATION_STEP_US = 5000ULL;
+
+	// V21.12 shadow-only full-LOS discrete observer. It never feeds BPN in this build.
+	static constexpr float SHADOW_LOS_RATE_LPF_TAU = 0.012f;
+	static constexpr float SHADOW_LOS_MIN_ANGLE_RAD = 1e-6f;
 
 	static constexpr float LOS_MISS_EST_LIMIT_RAD = 0.34906585f; // +/-20 deg
 	static constexpr uint64_t LOS_REACQUIRE_GRACE_US = 120000; // EKF姿态reset后允许LOS observer最多120ms重新建立差分基准
+	static constexpr uint64_t TARGET_LOSS_GRACE_US = 250000; // V21.9.1 target/control LOS短暂掉锁宽限250ms
 	static constexpr uint64_t LOS_ATTITUDE_SYNC_MAX_US = 40000; // 最多用body rate补偿+/-40ms姿态/LOS采样时差
-	// 【V20.9保留】image+gimbal+body三项融合后仍做25ms轻度低通；本轮只验证100ms时间对齐和云台中心差分，不同时改最终滤波。
-	static constexpr float INERTIAL_LOS_RATE_LPF_TAU = 0.025f;
+	// V21.12: poly6降低IMG微分噪声后，将image+gimbal+body融合后的最终低通缩短为10ms。
+	static constexpr float INERTIAL_LOS_RATE_LPF_TAU = 0.010f; // 保持低延迟主LPF
+
+	// V22.02: fixed-wing实飞中formal LOS-rate/BPN/collective出现约4Hz窄带振荡。
+	// 在10ms主LPF之后追加一个窄带notch，避免用重低通增加整体PN相位滞后。
+	// 系数按50Hz制导循环设计；Q=2.5仅压制约3~5Hz附近，不主动削弱低频真实目标机动。
+	static constexpr bool LOS_RATE_NOTCH_ENABLED = true;
+	static constexpr float LOS_RATE_NOTCH_FREQ_HZ = 4.0f;
+	static constexpr float LOS_RATE_NOTCH_Q = 2.5f;
+	static constexpr float LOS_RATE_NOTCH_FS_HZ = 50.0f;
+
 	static constexpr uint64_t LAUNCH_DURATION_US = 100000;
 
 	// V20.7：所有连续PX4_INFO诊断统一限制为5 Hz，主制导循环仍保持50 Hz不变。
@@ -717,36 +931,41 @@ private:
 	static constexpr uint64_t BENCH_PRINT_INTERVAL_US = DIAG_PRINT_INTERVAL_US;
 
 	// ============================================================
-	// V21.2 正式飞行入口选择
-	// true：AUX1 RELEASE通过后直接进入BPN ACTIVE（当前航拍跟随方案A）。
-	// false：恢复历史WAIT_RELEASE -> LAUNCH_CLEARANCE -> TRANSITION -> BPN流程。
-	// 注意：CLEARANCE/TRANSITION代码保留，但当前正式路径默认不使用。
+	// V21.5 正式飞行入口选择（A/B回退版）
+	// true：AUX1 RELEASE通过后直接进入BPN ACTIVE。
+	// false：WAIT_RELEASE -> LAUNCH_CLEARANCE -> TRANSITION -> BPN。
+	// 当前设为false，用于恢复缓冲阶段并与direct-BPN版本做A/B对照。
 	// ============================================================
-	static constexpr bool DIRECT_BPN_AFTER_RELEASE = true;
+	static constexpr bool DIRECT_BPN_AFTER_RELEASE = false;
 
 	// ============================================================
-	// Legacy rotor-only launch clearance（保留用于回退，当前正式路径不使用）
+	// Rotor-only launch clearance（V21.5正式路径重新启用）
 	// ============================================================
 
-	static constexpr uint64_t CLEARANCE_RAMP_DURATION_US = 100000;
-	static constexpr uint64_t CLEARANCE_HOLD_DURATION_US = 200000;
+	// 原CLEARANCE ramp/hold保留给SITL旧A/B路径；V21.7真机不再使用其“拉向水平”逻辑。
+	static constexpr uint64_t CLEARANCE_RAMP_DURATION_US = 100000; // SITL legacy: 0.10 s
+	static constexpr uint64_t CLEARANCE_HOLD_DURATION_US = 100000; // SITL legacy: 0.10 s
 
-	static constexpr float CLEARANCE_START_THRUST = 0.39f;
-	static constexpr float CLEARANCE_THRUST_LIMIT = 0.45f;
-	static constexpr float CLEARANCE_FORWARD_ACCEL = 0.55f;
+	// V21.7真机：RELEASE后固定保持RELEASE瞬间姿态100ms，再进入TRANSITION。
+	static constexpr uint64_t HW_CLEARANCE_HOLD_DURATION_US = 100000; // 0.10 s
+
+	static constexpr float CLEARANCE_START_THRUST = 0.25f; // 保持本次实飞实际参数
+	static constexpr float CLEARANCE_THRUST_LIMIT = 0.30f; // 保持本次实飞实际参数
+	static constexpr float CLEARANCE_FORWARD_ACCEL = 0.35f; // 保持本次实飞实际参数；V21.7真机hold路径不使用
 
 	// ============================================================
 	// CLEARANCE -> BPN transition
 	// ============================================================
-	// 0.5s
-	static constexpr uint64_t TRANSITION_DURATION_US = 400000;
+	// V21.7: 真机RELEASE accepted -> 0.10 s hold + 0.30 s transition = 0.40 s；
+	// 加上既有AUX1 HIGH 0.10 s确认，物理拨杆HIGH -> full BPN约0.50 s。
+	static constexpr uint64_t TRANSITION_DURATION_US = 300000;
 
 	// WAIT_RELEASE阶段guidance本身不给主动推力。
 	// 真机armed-idle由PX4输出/ESC机制负责。
 	static constexpr float WAIT_RELEASE_THRUST = 0.0f;
 
 	// ========================================================================
-	// >>>>>>>>>>>>>>> V21.2 航拍跟随 / BPN 主要调参区 <<<<<<<<<<<<<<<<
+	// >>>>>>>>>>>>>>> V21.3 航拍跟随 / BPN 主要调参区 <<<<<<<<<<<<<<<<
 	//
 	// 法向BPN：
 	//   a_BPN = PN_N * Vc * LOS_rate，并由BPN_ACCEL_MAX限幅。
@@ -759,24 +978,94 @@ private:
 	//                           实际axial_used还会受速度目标、SPEED_ACCEL_TAPER_BAND和推力预算限制。
 	//
 	// 推力标定：
-	//   HOVER_THRUST          ：二代机实测悬停归一化推力，本版=0.09。
+	//   HOVER_THRUST          ：5.5寸桨实测悬停归一化推力，本版=0.182。
 	//
 	// 其余与快速靠近直接相关的Vc、速度目标、speed brake、thrust limit参数紧随本区之后。
 	// ========================================================================
 
 	static constexpr float GRAVITY = 9.80665f;
-	static constexpr float HOVER_THRUST = 0.09f;
+	static constexpr float HOVER_THRUST = 0.182f;
 
 	// 【轴向加速度】沿LOS快速靠近目标的最大净加速度。
-	// static constexpr float AXIAL_ACCEL_MAX = 6.0f;
-	static constexpr float AXIAL_ACCEL_MAX = 3.5f;
+	// V22.02: 按固定翼跟踪需求提高约30%%：5.0->6.5m/s^2；速度无效降级值同步3.0->3.9m/s^2。
+	static constexpr float AXIAL_ACCEL_MAX = 6.5f;
+	static constexpr float AXIAL_ACCEL_DEGRADED_NO_VEL = 3.9f;
+
+	// V22.04: BPN法向加速度变化率限制改为LOS-rate自适应jerk。
+	// 仍在NED固定坐标系限制矢量delta，避免Body轴旋转本身被误判为jerk。
+	// 50Hz下：90/160/240m/s^3分别对应每周期约1.8/3.2/4.8m/s^2；
+	// raw-vs-shaped方向严重失配时最高允许300m/s^3（6.0m/s^2/周期）快速追赶。
+	static constexpr float BPN_JERK_LOW = 90.0f;   // m/s^3
+	static constexpr float BPN_JERK_MID = 160.0f;  // m/s^3
+	static constexpr float BPN_JERK_HIGH = 240.0f; // m/s^3
+	static constexpr float BPN_JERK_ABS_MAX = 300.0f; // m/s^3
+
+	static constexpr float BPN_JERK_LOS_RATE_P1 = 0.12f; // rad/s
+	static constexpr float BPN_JERK_LOS_RATE_P2 = 0.30f; // rad/s
+	static constexpr float BPN_JERK_LOS_RATE_P3 = 0.50f; // rad/s
+
+	static constexpr float BPN_JERK_DIR_BOOST_START_DEG = 35.0f;
+	static constexpr float BPN_JERK_DIR_BOOST_FULL_DEG = 75.0f;
+	static constexpr float BPN_JERK_DIR_BOOST_MAX = 1.25f;
+
+	// ============================================================
+	// V22.03 云台保护型起飞动态释放
+	// 从RELEASE真正接受时刻开始计时；CLEARANCE/TRANSITION也占用这1.5s窗口。
+	// 目的：起飞初期不要同时给满轴向、满BPN权限和110deg/s姿态命令，
+	// 降低机体50~100deg/s快速摆动迫使稳定云台高速反补偿而掉锁的概率。
+	// ============================================================
+	static constexpr uint64_t GIMBAL_PROTECT_DURATION_US = 1500000ULL; // 1.5 s
+	static constexpr float GIMBAL_PROTECT_AXIAL_START = 3.5f;          // m/s^2 -> 6.5
+	static constexpr float GIMBAL_PROTECT_BPN_SCALE_START = 0.75f;     // 75% -> 100%
+	static constexpr float GIMBAL_PROTECT_SLEW_START_DEG_S = 80.0f;    // deg/s -> 110
+
+	// ============================================================
+	// V22.06 continuous gimbal-load supervisor
+	//
+	// Safe region: no intervention.  When the two-axis gimbal is both far off-axis and/or moving hard,
+	// progressively reduce forward acceleration and attitude-command aggressiveness while preserving
+	// lateral BPN authority.  Thresholds are software protection-envelope seeds from recent flight logs,
+	// not claimed hardware limits; they should be calibrated from further logs.
+	// ============================================================
+	static constexpr float GIMBAL_LOAD_OFFAXIS_SAFE_DEG = 30.0f;
+	static constexpr float GIMBAL_LOAD_OFFAXIS_CRITICAL_DEG = 50.0f;
+	static constexpr float GIMBAL_LOAD_RATE_SAFE_DEG_S = 70.0f;
+	static constexpr float GIMBAL_LOAD_RATE_CRITICAL_DEG_S = 110.0f;
+	static constexpr float GIMBAL_LOAD_ACCEL_SAFE_DEG_S2 = 600.0f;
+	static constexpr float GIMBAL_LOAD_ACCEL_CRITICAL_DEG_S2 = 1200.0f;
+	static constexpr float GIMBAL_LOAD_ACCEL_LPF_TAU = 0.08f;
+	static constexpr float GIMBAL_LOAD_LPF_TAU = 0.12f;
+	static constexpr float GIMBAL_LOAD_NO_ACTION = 0.25f;
+
+	// Supervisor outputs.  Normal/safe load leaves V22.05 behaviour unchanged.
+	static constexpr float GIMBAL_SUPERVISOR_AXIAL_MIN = 3.0f;
+	static constexpr float GIMBAL_SUPERVISOR_SLEW_MIN_DEG_S = 90.0f;
+	static constexpr float GIMBAL_SUPERVISOR_LEAD_HIGH_DEG = 18.0f;
+	static constexpr float GIMBAL_SUPERVISOR_LEAD_CRITICAL_DEG = 7.0f;
+
+	// Hysteresis for diagnostic state labels.  Continuous control scheduling uses the filtered load directly.
+	static constexpr float GIMBAL_LOAD_CAUTION_ENTER = 0.30f;
+	static constexpr float GIMBAL_LOAD_CAUTION_EXIT = 0.18f;
+	static constexpr float GIMBAL_LOAD_HIGH_ENTER = 0.60f;
+	static constexpr float GIMBAL_LOAD_HIGH_EXIT = 0.45f;
+	static constexpr float GIMBAL_LOAD_CRITICAL_ENTER = 0.85f;
+	static constexpr float GIMBAL_LOAD_CRITICAL_EXIT = 0.70f;
+
+	// EKF attitude/yaw-reset transient guard.  A reset changes the estimated reference instantly although
+	// the airframe did not physically rotate.  Re-anchor quaternion setpoints as before, reset the NED BPN
+	// jerk state, and temporarily reduce dynamic demand so the correction is not amplified into a real motion.
+	static constexpr float ATT_RESET_GUARD_TRIGGER_DEG = 5.0f;
+	static constexpr uint64_t ATT_RESET_GUARD_DURATION_US = 180000ULL;
+	static constexpr float ATT_RESET_GUARD_AXIAL_CAP = 3.0f;
+	static constexpr float ATT_RESET_GUARD_SLEW_CAP_DEG_S = 85.0f;
+	static constexpr float ATT_RESET_GUARD_LEAD_CAP_DEG = 7.0f;
 
 	// 【法向BPN】比例导航系数 N。
 	static constexpr float PN_N = 3.0f;
-	// 【法向BPN】正式飞行commissioning缩放。当前1.1>=0.999，因此apply_flight_commissioning_gain()不再额外缩放。
+	// 【法向BPN】正式飞行commissioning缩放。当前1.0，正式BPN不再额外缩小。
 	// RIG stage1/2/3不使用此参数；1.0f代表完整正式BPN权限。
 	// static constexpr float FLIGHT_COMMISSIONING_GAIN = 0.25f;
-	static constexpr float FLIGHT_COMMISSIONING_GAIN = 1.1f;
+	static constexpr float FLIGHT_COMMISSIONING_GAIN = 1.0f;
 
 	// 【法向BPN】法向加速度绝对上限 [m/s^2]。
 	// static constexpr float BPN_ACCEL_MAX = 12.0f;
@@ -788,21 +1077,60 @@ private:
 	// ============================================================
 
 	static constexpr float VC_FALLBACK = 10.0f;
-	static constexpr float VC_MAX = 15.0f;
+	static constexpr float VC_MAX = 25.0f;
+
+	// V22.01 fixed-wing tracking: target velocity is unknown, therefore do NOT guess Vt.
+	// Equivalent target model for control is Vt_NED=[0,0,0], so Vc_est = Va_NED dot LOS_NED.
+	// The former balloon-only [0,0,-3]m/s compensation is explicitly disabled.
+	static constexpr bool TARGET_VELOCITY_COMPENSATION_ENABLED = false;
+	static constexpr float TARGET_CLIMB_SPEED_MPS = 0.0f; // compatibility field; inactive when compensation=false
 	// static constexpr float VC_FALLBACK = 20.0f;
 	// static constexpr float VC_MAX = 120.0f;
 	static constexpr float VC_LPF_TAU_RISE = 0.12f;
 	static constexpr float VC_LPF_TAU_FALL = 0.03f;
+	// V22.01: when all velocity sources are unavailable, blend toward fixed fallback rather than step to it.
+	static constexpr float VC_FALLBACK_BLEND_TAU = 0.35f;
+
+	// ============================================================
+	// V21.11 EKF速度失效时的短时IMU惯导速度回退
+	// vehicle_acceleration.xyz为FRD Body下bias-corrected acceleration（含重力效应）。
+	// 惯性NED加速度 = R_nb * accel_body + [0,0,g]。
+	// 只作为短时速度参考，绝不作为长期导航解。
+	// ============================================================
+	static constexpr uint64_t IMU_ACCEL_TIMEOUT_US = 100000ULL;
+	static constexpr uint64_t IMU_VEL_FALLBACK_MAX_US = 6000000ULL; // V22.01: 最多6s纯IMU积分
+	static constexpr float IMU_ACCEL_LPF_TAU = 0.040f;              // 40ms，抑制振动积分漂移
+	static constexpr float IMU_ACCEL_MAX_NORM = 35.0f;              // m/s^2，异常脉冲限幅
+	static constexpr float IMU_VELOCITY_MAX = 35.0f;                // m/s，防积分发散
+	static constexpr float IMU_DT_MIN = 0.001f;
+	static constexpr float IMU_DT_MAX = 0.080f;
+	// V22.01: EKF/IMU速度不可用时，轴向能力从当前值平滑退到3m/s^2，避免5->3瞬时台阶。
+	static constexpr float AXIAL_DEGRADED_BLEND_TAU = 0.35f;
+
+	// ============================================================
+	// V21.14 EKF速度reset保护：reset/单帧大跳变后，短时保持连续的IMU惯导速度，
+	// 防止EKF新参考系速度瞬间跳变直接把Vc翻负、让BPN在终端段清零。
+	// HOLD结束后仅当EKF与IMU重新接近时才开始平滑回切；到GUARD_MAX后仅放宽到FORCE阈值，
+	// 若差异仍很大则继续保持IMU/固定fallback，绝不强行吃入明显跳变的EKF速度。
+	// ============================================================
+	static constexpr uint64_t EKF_RESET_IMU_HOLD_US = 800000ULL;       // reset后至少0.8s纯IMU速度
+	static constexpr uint64_t EKF_RESET_BLEND_BACK_US = 400000ULL;     // EKF恢复后0.4s平滑融合回EKF
+	static constexpr uint64_t EKF_RESET_GUARD_MAX_US = 1500000ULL;     // 最长1.5s等待EKF重新一致
+	static constexpr uint64_t EKF_VEL_JUMP_MAX_DT_US = 100000ULL;      // 仅检测100ms内的瞬时速度跳变
+	static constexpr float EKF_VEL_JUMP_TRIGGER_MPS = 3.0f;            // 单次更新|dV|>3m/s触发保护
+	static constexpr float EKF_REACQUIRE_MAX_DIFF_MPS = 2.5f;          // EKF/IMU速度差<=2.5m/s允许正常回切
+	static constexpr float EKF_REACQUIRE_FORCE_MAX_DIFF_MPS = 5.0f;    // 超过GUARD_MAX后也仅在差<=5m/s时允许强制回切
 
 	// ============================================================
 	// 【BPN调参】轴向速度目标 / 快速靠近速度管理
 	//
-	// <=0.05rad/s -> 26m/s
-	//  0.05~0.15  -> 26 ~ 24m/s
-	//  0.15~0.30  -> 24 ~ 21m/s
-	// >=0.30      -> 18m/s
+	// <=0.05rad/s -> 25m/s
+	//  0.05~0.15  -> 25 -> 24m/s
+	//  0.15~0.35  -> 24 -> 22m/s
+	//  0.35~0.60  -> 22 -> 20m/s
+	// >=0.60      -> 20m/s
 	//
-	// 28m/s作为硬速度保护阈值。
+	// 28m/s为当前名义硬速度保护上限；26m/s开始硬制动。
 	// ============================================================
 
 	// Stable:
@@ -812,11 +1140,11 @@ private:
 	// static constexpr float GUIDANCE_SPEED_MIN = 6.0f;
 	// static constexpr float GUIDANCE_SPEED_HARD_LIMIT = 12.0f;
 
-	static constexpr float GUIDANCE_SPEED_CRUISE = 15.0f;
-	static constexpr float GUIDANCE_SPEED_MID_1 = 14.0f;
-	static constexpr float GUIDANCE_SPEED_MID_2 = 13.0f;
-	static constexpr float GUIDANCE_SPEED_MIN = 6.0f;
-	static constexpr float GUIDANCE_SPEED_HARD_LIMIT = 17.0f;
+	static constexpr float GUIDANCE_SPEED_CRUISE = 25.0f;
+	static constexpr float GUIDANCE_SPEED_MID_1 = 24.0f;
+	static constexpr float GUIDANCE_SPEED_MID_2 = 22.0f;
+	static constexpr float GUIDANCE_SPEED_MIN = 20.0f;
+	static constexpr float GUIDANCE_SPEED_HARD_LIMIT = 28.0f;
 
 	// NOW:
 	// static constexpr float GUIDANCE_SPEED_CRUISE = 120.0f;
@@ -836,20 +1164,22 @@ private:
 	static constexpr float LOS_RATE_SPEED_POINT_1 = 0.05f;
 	static constexpr float LOS_RATE_SPEED_POINT_2 = 0.15f;
 	static constexpr float LOS_RATE_SPEED_POINT_3 = 0.35f;
+	// V21.3：消除0.35rad/s处13->6m/s阶跃；0.35~0.60rad/s连续降到GUIDANCE_SPEED_MIN。
+	static constexpr float LOS_RATE_SPEED_POINT_4 = 0.60f;
 
 	// 在目标速度前4m/s开始逐渐收掉轴向加速。
-	static constexpr float SPEED_ACCEL_TAPER_BAND = 2.0f;
+	static constexpr float SPEED_ACCEL_TAPER_BAND = 4.0f;
 	// static constexpr float SPEED_ACCEL_TAPER_BAND = 5.0f;
 
 	// 一旦超过动态目标速度就开始主动制动。
 	static constexpr float SPEED_BRAKE_DEADBAND = 0.0f;
 	static constexpr float SPEED_BRAKE_KP = 3.0f;
-	static constexpr float SPEED_BRAKE_ACCEL_MAX = 4.0f;
+	static constexpr float SPEED_BRAKE_ACCEL_MAX = 6.0f;
 
-	// 在28m/s之前提前1m/s进入硬保护，避免等超过28再反应。
-	static constexpr float HARD_SPEED_BRAKE_START = 16.0f;
-	static constexpr float HARD_SPEED_BRAKE_KP = 3.0f;
-	static constexpr float HARD_SPEED_BRAKE_ACCEL_MAX = 5.0f;
+	// 26m/s开始渐进硬制动；达到/超过28m/s名义硬上限时直接使用最大硬制动。
+	static constexpr float HARD_SPEED_BRAKE_START = 26.0f;
+	static constexpr float HARD_SPEED_BRAKE_KP = 4.0f;
+	static constexpr float HARD_SPEED_BRAKE_ACCEL_MAX = 8.0f;
 
 	// static constexpr float HARD_SPEED_BRAKE_START = 121.0f;
 	// static constexpr float HARD_SPEED_BRAKE_KP = 5.0f;
@@ -863,12 +1193,12 @@ private:
 	// 【BPN调参】总推力预算上限
 	// ============================================================
 
-	static constexpr float GUIDANCE_THRUST_LIMIT = 0.60f;
-	// 正式BPN高度底线保护可临时使用的额外推力预算。
-	// 数值沿用旧CLEARANCE_THRUST_LIMIT=0.45，但语义独立，避免直接BPN路径继续依赖legacy CLEARANCE参数名。
-	static constexpr float ALT_FLOOR_THRUST_LIMIT = 0.45f;
+	static constexpr float GUIDANCE_THRUST_LIMIT = 0.50f;
+	// V21.3：高度保护介入时绝不能把可用推力预算从正常BPN的0.50反向降低。
+	// 当前先保持与正常BPN相同的0.50预算；后续若日志证明需要更多掉高恢复余量，可再单独提高。
+	static constexpr float ALT_FLOOR_THRUST_LIMIT = GUIDANCE_THRUST_LIMIT;
 
-	// TEST/SP_IFACE只用于未解锁零真实推力测试：候选计算沿用正常BPN的0.75预算，避免低预算提前把BPN裁掉；真正发布的thrust始终为0。
+	// TEST/SP_IFACE只用于未解锁零真实推力测试：候选计算沿用正常BPN的当前推力预算，避免低预算提前把BPN裁掉；真正发布的thrust始终为0。
 	static constexpr float BPN_TEST_THRUST_LIMIT = GUIDANCE_THRUST_LIMIT;
 	// 台架姿态笼：以执行“pn_guidance test on”瞬间姿态为中心，最终CMD最多偏离15deg，便于直观看清目标移动对应的Roll/Pitch方向。
 	static constexpr float BPN_TEST_ATTITUDE_MAX_DEG = 15.0f;
@@ -902,20 +1232,47 @@ private:
 	static constexpr float RIG_MOTOR_OUTPUT_ABORT = 0.50f;
 	static constexpr uint64_t RIG_PRINT_INTERVAL_US = DIAG_PRINT_INTERVAL_US; // V20.7: RIG print rate 5Hz
 
-	// 二代机悬停约0.09，MIN_THRUST必须明显低于悬停值，否则0.09会被强制夹到0.10。
-	static constexpr float MIN_THRUST = 0.04f;
+	// 5.5寸桨当前实测悬停约0.182；MIN_THRUST=0.10低于悬停值，不会把悬停推力夹高。
+	static constexpr float MIN_THRUST = 0.10f;
 	static constexpr float MAX_THRUST = 0.95f;
 
 	// 发射初段允许姿态目标快速变化
-	static constexpr float CLEARANCE_ATTITUDE_SLEW_DEG_S = 75.0f;
+	static constexpr float CLEARANCE_ATTITUDE_SLEW_DEG_S = 110.0f;
 	static constexpr float CLEARANCE_ATTITUDE_SLEW_RAD_S = CLEARANCE_ATTITUDE_SLEW_DEG_S * M_PI_F / 180.f;
 
 	// Guidance姿态setpoint限制,正常BPN继续保持比较平滑
-	static constexpr float GUIDANCE_ATTITUDE_SLEW_DEG_S = 55.0f;
+	static constexpr float GUIDANCE_ATTITUDE_SLEW_DEG_S = 110.0f;
 	static constexpr float GUIDANCE_ATTITUDE_SLEW_RAD_S = GUIDANCE_ATTITUDE_SLEW_DEG_S * M_PI_F / 180.f;
 
-	static constexpr float GUIDANCE_ATTITUDE_LEAD_MAX_DEG = 45.0f;
+	// V22.05: only terminal/high-LOS-rate geometry is allowed to exceed the nominal 110deg/s.
+	static constexpr float GUIDANCE_ATTITUDE_SLEW_MID_DEG_S = 123.0f;
+	static constexpr float GUIDANCE_ATTITUDE_SLEW_HIGH_DEG_S = 135.0f;
+	static constexpr float GUIDANCE_SLEW_LOS_RATE_P1 = 0.15f; // rad/s
+	static constexpr float GUIDANCE_SLEW_LOS_RATE_P2 = 0.30f; // rad/s
+	static constexpr float GUIDANCE_SLEW_LOS_RATE_P3 = 0.50f; // rad/s
+
+	// V22.05 weak camera-boresight centering assist. It is intentionally much smaller than BPN_MAX.
+	// This term is not a replacement for PN: it only reduces accumulated camera miss during rapid terminal geometry.
+	static constexpr float CENTERING_ASSIST_GAIN = 10.0f;       // m/s^2 per rad tangent error
+	static constexpr float CENTERING_ASSIST_MAX = 1.20f;        // m/s^2
+	static constexpr float CENTERING_ASSIST_START_DEG = 0.50f;  // deadband
+	static constexpr float CENTERING_ASSIST_FULL_DEG = 3.50f;
+	static constexpr float CENTERING_ASSIST_MIN_LOS_RATE = 0.10f; // rad/s
+
+
+	static constexpr float GUIDANCE_ATTITUDE_LEAD_MAX_DEG = 65.0f;
 	static constexpr float GUIDANCE_ATTITUDE_LEAD_MAX_RAD = GUIDANCE_ATTITUDE_LEAD_MAX_DEG * M_PI_F / 180.f;
+
+	// V21.14 推力矢量可行域：正推力四旋翼不允许acceleration_to_attitude()
+	// 穿过90deg进入倒飞分支。将期望Body +Z限制在NED +Z周围75deg圆锥内。
+	// 这不是普通姿态lead/slew，而是上游“物理可实现性”约束。
+	static constexpr float GUIDANCE_THRUST_VECTOR_MAX_TILT_DEG = 75.0f;
+	static constexpr float GUIDANCE_THRUST_VECTOR_MAX_TILT_RAD = GUIDANCE_THRUST_VECTOR_MAX_TILT_DEG * M_PI_F / 180.f;
+
+	// V21.7过渡期专用lead限制；正式BPN使用GUIDANCE_ATTITUDE_LEAD_MAX_DEG（当前65deg）。
+	static constexpr float CLEARANCE_ATTITUDE_LEAD_MAX_DEG = 8.0f;
+	static constexpr float TRANSITION_ATTITUDE_LEAD_START_DEG = 8.0f;
+	static constexpr float TRANSITION_ATTITUDE_LEAD_END_DEG = 10.0f;
 
 	// ============================================================
 	// RELEASE高度底线保护
@@ -994,6 +1351,7 @@ private:
 	static constexpr float RC_RELEASE_HIGH_THRESHOLD = 0.50f;
 	static constexpr uint64_t RC_RELEASE_CONFIRM_US = 100000; // HIGH连续100ms才接受RELEASE
 	static constexpr uint64_t RC_RELEASE_TIMEOUT_US = 500000; // 真机RC消息超过500ms未更新视为失效
+	static constexpr uint64_t RC_CONTROL_MODE_TIMEOUT_US = 500000; // V21.4: 模式状态超过500ms不参与RC所有权判定
 
 	// 仿真虚拟拨杆参数：进入WAIT_RELEASE后先保持LOW；只有释放条件连续稳定300ms，才把虚拟AUX1拨到HIGH。
 	// 这样不是“ARM后立刻发射”，而是尽量复现真机操作者确认条件后再拨RELEASE开关的顺序。
@@ -1010,6 +1368,7 @@ private:
 	uORB::Subscription _cgtd070_status_sub{ORB_ID(cgtd070_status)};
 	uORB::Subscription _attitude_sub{ORB_ID(vehicle_attitude)};
 	uORB::Subscription _angular_velocity_sub{ORB_ID(vehicle_angular_velocity)};
+	uORB::Subscription _vehicle_acceleration_sub{ORB_ID(vehicle_acceleration)};
 	uORB::Subscription _local_position_sub{ORB_ID(vehicle_local_position)};
 	uORB::Subscription _vehicle_status_sub{ORB_ID(vehicle_status)};
 	uORB::Subscription _manual_control_sub{ORB_ID(manual_control_setpoint)};
@@ -1025,6 +1384,7 @@ private:
 	uORB::Publication<pn_guidance_los_diag_s> _pn_guidance_los_diag_pub{ORB_ID(pn_guidance_los_diag)};
 	uORB::Publication<pn_guidance_guidance_diag_s> _pn_guidance_guidance_diag_pub{ORB_ID(pn_guidance_guidance_diag)};
 	uORB::Publication<pn_guidance_control_diag_s> _pn_guidance_control_diag_pub{ORB_ID(pn_guidance_control_diag)};
+	uORB::Publication<pn_guidance_observer_diag_s> _pn_guidance_observer_diag_pub{ORB_ID(pn_guidance_observer_diag)};
 
 	// ============================================================
 	// 消息缓存
@@ -1035,6 +1395,7 @@ private:
 	cgtd070_status_s _cgtd070_status{};
 	vehicle_attitude_s _attitude{};
 	vehicle_angular_velocity_s _angular_velocity{};
+	vehicle_acceleration_s _vehicle_acceleration{};
 	vehicle_local_position_s _local_position{};
 	vehicle_status_s _vehicle_status{};
 	manual_control_setpoint_s _manual_control{};
@@ -1118,6 +1479,8 @@ private:
 
 	float _last_v19_body_rotation_deg{0.f};
 	uint64_t _last_attitude_reset_time{0};
+	uint64_t _attitude_reset_guard_until{0};
+	float _last_attitude_reset_angle_deg{0.f};
 	uint64_t _last_v19_metric_los_rx_time{0};
 	uint32_t _v19_metric_count{0};
 	float _v19_error_sq_sum{0.f};
@@ -1134,13 +1497,66 @@ private:
 	float _gimbal_az_rate_filtered{0.f};
 	float _gimbal_pitch_rate_filtered{0.f};
 	bool _gimbal_rate_filter_initialized{false};
+
+	// V22.06 gimbal-load supervisor state.
+	uint64_t _gimbal_load_last_los_rx_time{0};
+	uint64_t _gimbal_load_last_update_time{0};
+	float _gimbal_load_prev_az_rate{0.f};
+	float _gimbal_load_prev_pitch_rate{0.f};
+	bool _gimbal_load_rate_initialized{false};
+	float _gimbal_offaxis_deg{0.f};
+	float _gimbal_rate_mag_deg_s{0.f};
+	float _gimbal_accel_mag_deg_s2{0.f};
+	float _gimbal_accel_mag_filtered_deg_s2{0.f};
+	float _gimbal_geometry_load{0.f};
+	float _gimbal_dynamic_load{0.f};
+	float _gimbal_control_load{0.f};
+	float _gimbal_load_raw{0.f};
+	float _gimbal_load{0.f};
+	GimbalLoadState _gimbal_load_state{GimbalLoadState::NORMAL};
+	float _gimbal_supervisor_axial_cap{AXIAL_ACCEL_MAX};
+	float _gimbal_supervisor_slew_cap_deg_s{GUIDANCE_ATTITUDE_SLEW_HIGH_DEG_S};
+	float _gimbal_supervisor_lead_cap_deg{GUIDANCE_ATTITUDE_LEAD_MAX_DEG};
 	// 【V20.5修改】三项现在直接参与惯性LOS-rate融合；fused_raw保留低通前结果用于BENCH/HW诊断。
 	Vector3f _los_dot_image_body{0.f, 0.f, 0.f};
 	Vector3f _los_dot_gimbal_body{0.f, 0.f, 0.f};
 	Vector3f _los_dot_body_motion{0.f, 0.f, 0.f};
 	Vector3f _los_dot_fused_raw_body{0.f, 0.f, 0.f};
+	// V22.02 keeps LPF state separate from the final notched formal LOS-rate used by BPN.
+	Vector3f _los_dot_inertial_lpf_body{0.f, 0.f, 0.f};
 	Vector3f _los_dot_inertial_body{0.f, 0.f, 0.f};
 	bool _los_rate_filter_initialized{false};
+	bool _los_rate_notch_initialized{false};
+	Vector3f _los_rate_notch_x1{0.f, 0.f, 0.f};
+	Vector3f _los_rate_notch_x2{0.f, 0.f, 0.f};
+	Vector3f _los_rate_notch_y1{0.f, 0.f, 0.f};
+	Vector3f _los_rate_notch_y2{0.f, 0.f, 0.f};
+
+	// V21.10 current-time LOS prediction diagnostics/state.
+	Vector3f _los_control_body{0.f, 0.f, -1.f};
+	Vector3f _los_dot_control_body{0.f, 0.f, 0.f};
+	bool _los_prediction_valid{false};
+	uint64_t _los_prediction_age_us{0};
+	float _los_prediction_angle_deg{0.f};
+
+	// V21.12 complete-LOS discrete observer shadow state. Diagnostic only.
+	bool _shadow_los_initialized{false};
+	bool _shadow_los_rate_valid{false};
+	bool _shadow_los_rate_filter_initialized{false};
+	uint64_t _shadow_prev_sample_time{0};
+	float _shadow_dt_s{0.f};
+	float _shadow_residual_angle_deg{0.f};
+	float _shadow_filter_alpha{0.f};
+	Vector3f _shadow_prev_los_body{0.f, 0.f, -1.f};
+	Vector3f _shadow_los_dot_raw_body{0.f, 0.f, 0.f};
+	Vector3f _shadow_los_dot_filt_body{0.f, 0.f, 0.f};
+	bool _shadow_prediction_valid{false};
+	uint64_t _shadow_prediction_age_us{0};
+	float _shadow_prediction_angle_deg{0.f};
+	Vector3f _shadow_los_pred_body{0.f, 0.f, -1.f};
+	Vector3f _shadow_los_dot_pred_body{0.f, 0.f, 0.f};
+	float _shadow_formal_rate_angle_deg{0.f};
+	float _shadow_formal_pred_angle_deg{0.f};
 
 	// ============================================================
 	// 【V20.8新增】PnGuidanceDiag 50Hz ULog专用缓存
@@ -1159,6 +1575,9 @@ private:
 	float _diag_board_los_el_rate{0.f};
 	float _diag_miss_az_rate_px4{0.f};
 	float _diag_miss_el_rate_px4{0.f};
+	float _diag_miss_az_rate_backward3{0.f};
+	float _diag_miss_el_rate_backward3{0.f};
+	uint8_t _diag_miss_rate_mode{0}; // 0 invalid, 1 backward3 bootstrap, 2 causal poly6
 	bool _diag_miss_rate_valid{false};
 
 	float _diag_gimbal_delta_az{0.f};
@@ -1188,6 +1607,10 @@ private:
 	bool _los_reacquire_active{false};
 	uint64_t _los_reacquire_start_time{0};
 	bool _los_reacquire_hold_logged{false};
+
+	uint64_t _target_loss_start_time{0};
+	bool _target_loss_hold_logged{false};
+
 	float _last_los_attitude_sync_dt_s{0.f};
 	bool _last_valid_guidance_cmd_valid{false};
 	uint64_t _last_valid_guidance_cmd_time{0};
@@ -1201,6 +1624,12 @@ private:
 	uint64_t _last_actuator_motors_rx_time{0};
 	uint64_t _last_control_mode_rx_time{0};
 	uint64_t _last_torque_setpoint_rx_time{0};
+
+	// V21.4 RC绝对优先级仲裁：一旦正式制导后发生飞行模式接管，锁存到本次DISARM。
+	bool _rc_override_latched{false};
+	bool _guidance_release_nav_state_valid{false};
+	uint8_t _guidance_release_nav_state{0};
+	uint64_t _last_rc_override_warn_time{0};
 	uint64_t _last_thrust_setpoint_rx_time{0};
 
 	// RC RELEASE互锁状态全部由Run()工作队列维护。
@@ -1281,8 +1710,33 @@ private:
 	float _vc_raw{0.f};
 	float _vc_filtered{0.f};
 	float _vc_used{VC_FALLBACK};
+	// V21.13 decomposition for diagnostics: Vc_rel = Vc_aircraft - Vtarget dot LOS.
+	float _vc_aircraft_only{0.f};
+	float _vc_target_projection{0.f};
+	float _vc_relative_raw{0.f};
 
 	uint64_t _last_vc_update_time{0};
+
+	// V21.11: short-term strapdown velocity fallback in NED.
+	Vector3f _imu_velocity_ned{0.f, 0.f, 0.f};
+	Vector3f _imu_accel_ned_filtered{0.f, 0.f, 0.f};
+	bool _imu_velocity_initialized{false};
+	bool _imu_velocity_valid{false};
+	bool _imu_accel_filter_initialized{false};
+	bool _imu_velocity_seeded_from_ekf{false};
+	uint64_t _imu_velocity_anchor_time{0};
+	uint64_t _imu_velocity_last_sample_time{0};
+	uint64_t _last_accel_rx_time{0};
+
+	// V21.14: EKF reset/velocity jump continuity guard.
+	bool _ekf_velocity_guard_active{false};
+	bool _ekf_velocity_blend_active{false};
+	bool _ekf_velocity_guard_timeout_warned{false};
+	uint64_t _ekf_velocity_guard_start_time{0};
+	uint64_t _ekf_velocity_blend_start_time{0};
+	float _ekf_velocity_blend_alpha{0.f};
+	float _last_ekf_imu_velocity_diff{NAN};
+	uint64_t _last_local_position_rx_time{0};
 
 	bool _had_positive_closing{false};
 	uint64_t _negative_closing_start_time{0};
@@ -1296,6 +1750,19 @@ private:
 	float _last_speed_axial_scale{1.f};
 	float _last_speed_brake{0.f};
 	float _last_axial_limit_cmd{AXIAL_ACCEL_MAX};
+	bool _last_guidance_speed_valid{false}; // V22.01: smooth only velocity-source validity handovers
+
+	// V22.03: post-RELEASE gimbal-protection scheduling state/diagnostics.
+	uint64_t _guidance_release_time{0};
+	float _last_gimbal_protect_phase{1.f};
+	float _last_gimbal_protect_axial_cap{AXIAL_ACCEL_MAX};
+	float _last_gimbal_protect_bpn_scale{1.f};
+	float _last_gimbal_protect_slew_deg_s{GUIDANCE_ATTITUDE_SLEW_DEG_S};
+
+	// V22.05 terminal-response diagnostics.
+	uint64_t _last_control_extra_lead_us{LOS_CONTROL_EXTRA_LEAD_MIN_US};
+	float _last_adaptive_slew_deg_s{GUIDANCE_ATTITUDE_SLEW_DEG_S};
+	float _last_centering_assist_norm{0.f};
 
 	// ============================================================
 	// 高度底线保护
@@ -1318,6 +1785,9 @@ private:
 
 	float _last_thrust_sp{0.f};
 	float _last_attitude_slew_deg_s{GUIDANCE_ATTITUDE_SLEW_DEG_S};
+	bool _last_thrust_vector_feasibility_limited{false};
+	float _last_thrust_vector_raw_tilt_deg{0.f};
+	float _last_thrust_vector_cmd_tilt_deg{0.f};
 	bool _slew_active{false};
 	float _last_raw_q_step_deg{0.f};
 
@@ -1325,6 +1795,13 @@ private:
 	float _last_attitude_lead_deg{0.f};
 
 	Vector3f _last_bpn_body{0.f, 0.f, 0.f};
+
+	// V22.02 BPN jerk limiter state in NED.
+	Vector3f _bpn_accel_ned_jerk_limited{0.f, 0.f, 0.f};
+	bool _bpn_jerk_initialized{false};
+	uint64_t _last_bpn_jerk_update_time{0};
+	float _last_bpn_jerk_limit{BPN_JERK_LOW};
+	float _last_bpn_jerk_dir_error_deg{0.f};
 
 	float _last_axial_used{0.f};
 	float _last_bpn_norm_raw{0.f};
@@ -1641,6 +2118,7 @@ private:
 		const bool rc_ok = rc_release_input_valid(now);
 		const bool body_ok = body_rate_valid(now);
 		const float ekf_speed = get_ekf_speed();
+		const float guidance_speed = get_guidance_speed();
 
 		PX4_INFO("HW5 H arm=%d RC=%d tgt=%d fresh=%d rate=%d body=%d age=%.1fms gyro=%+.1fms dt=%.1fms",
 			 (int)armed(), (int)rc_ok, (int)_los.target_valid, (int)los_fresh(now),
@@ -1656,27 +2134,110 @@ private:
 			 (double)_los_dot_inertial_body(0), (double)_los_dot_inertial_body(1),
 			 (double)_los_dot_inertial_body(2), (double)rate_mag);
 
-		PX4_INFO("HW5 SRC I=%.4f G=%.4f B=%.4f F=%.4f GRate=[%+.3f %+.3f] VC=%.2f/%.2f/%.2f v=%d spd=%.2f NO_CONTROL",
+		PX4_INFO("HW5 SRC I=%.4f G=%.4f B=%.4f F=%.4f GRate=[%+.3f %+.3f] VC=%.2f/%.2f/%.2f VaLOS=%.2f VtLOS=%.2f v=%d src=%s spd=%.2f EKF=%.2f NO_CONTROL",
 			 (double)_los_dot_image_body.norm(), (double)_los_dot_gimbal_body.norm(),
 			 (double)_los_dot_body_motion.norm(), (double)_los_dot_fused_raw_body.norm(),
 			 (double)_gimbal_az_rate_filtered, (double)_gimbal_pitch_rate_filtered,
-			 (double)_vc_raw, (double)_vc_filtered, (double)_vc_used, (int)_vc_valid,
-			 (double)ekf_speed);
+			 (double)_vc_raw, (double)_vc_filtered, (double)_vc_used,
+			 (double)_vc_aircraft_only, (double)_vc_target_projection,
+			 (int)_vc_valid, guidance_velocity_source_name(),
+			 (double)guidance_speed, (double)ekf_speed);
 	}
 
 	// ============================================================
 	// RELEASE状态/互锁：真机RC + SITL虚拟AUX1
 	// ============================================================
 
-	bool rc_release_input_valid(const uint64_t now) const
+	bool rc_input_valid(const uint64_t now) const
 	{
-		// 真机模式必须是最近500ms内真实RC产生的manual_control_setpoint。
-		// QGC joystick / MAVLink MANUAL_CONTROL不能冒充正式RELEASE输入。
+		// RC所有权只依赖“真实RC链路是否新鲜有效”，绝不依赖AUX1数值。
+		// 这样即使AUX1映射异常/NaN，飞手切入Manual/Stabilized时仍然拥有最高控制优先级。
 		if (_last_manual_control_rx_time == 0 || now < _last_manual_control_rx_time
 		    || now - _last_manual_control_rx_time > RC_RELEASE_TIMEOUT_US) { return false; }
 		return _manual_control.valid
-		       && _manual_control.data_source == manual_control_setpoint_s::SOURCE_RC
-		       && PX4_ISFINITE(_manual_control.aux1);
+		       && _manual_control.data_source == manual_control_setpoint_s::SOURCE_RC;
+	}
+
+	bool rc_release_input_valid(const uint64_t now) const
+	{
+		// RELEASE在真实RC链路有效基础上，再额外要求AUX1本身为有限值。
+		// QGC joystick / MAVLink MANUAL_CONTROL不能冒充正式RELEASE输入。
+		return rc_input_valid(now) && PX4_ISFINITE(_manual_control.aux1);
+	}
+
+
+	// V21.9: RC人工控制所有权覆盖Manual/Stabilized/Acro。
+	// 只要manual+rates有效，且altitude/velocity/position均未接管，就视为飞手直接控制；
+	// Stabilized通常attitude=true，Acro通常attitude=false，但两者都必须让pn_guidance完全让权。
+	bool rc_manual_attitude_owner_active(const uint64_t now) const
+	{
+		if (SIMULATION_MODE || !armed() || _rig_stage.load() != 0u) {
+			return false;
+		}
+
+		if (_last_control_mode_rx_time == 0 || now < _last_control_mode_rx_time
+		    || now - _last_control_mode_rx_time > RC_CONTROL_MODE_TIMEOUT_US) {
+			return false;
+		}
+
+		if (!rc_input_valid(now)) {
+			return false;
+		}
+
+		return _vehicle_control_mode.flag_control_rates_enabled
+		       && _vehicle_control_mode.flag_control_manual_enabled
+		       && !_vehicle_control_mode.flag_control_altitude_enabled
+		       && !_vehicle_control_mode.flag_control_velocity_enabled
+		       && !_vehicle_control_mode.flag_control_position_enabled;
+	}
+
+	bool formal_guidance_active() const
+	{
+		return (_state == GuidanceState::BPN && _launch_sequence_complete)
+		       || _state == GuidanceState::LAUNCH_CLEARANCE
+		       || _state == GuidanceState::TRANSITION;
+	}
+
+	void reset_rc_override_latch()
+	{
+		_rc_override_latched = false;
+		_guidance_release_nav_state_valid = false;
+		_guidance_release_nav_state = 0;
+		_last_rc_override_warn_time = 0;
+	}
+
+	void latch_rc_override(const uint64_t now, const char *reason)
+	{
+		if (!_rc_override_latched) {
+			_rc_override_latched = true;
+			PX4_WARN("RC OVERRIDE LATCHED: %s; pn_guidance yields attitude setpoint until DISARM", reason);
+		}
+		_last_rc_override_warn_time = now;
+	}
+
+	void update_rc_authority(const uint64_t now, const bool is_armed)
+	{
+		if (!is_armed) {
+			reset_rc_override_latch();
+			return;
+		}
+
+		// RELEASE建立nav_state基线后，无论当前处于CLEARANCE/TRANSITION/BPN还是SAFE_HOVER，
+		// 都持续监视人工接管，直到DISARM清除基线与override latch。
+		if (_rc_override_latched || !_guidance_release_nav_state_valid) {
+			return;
+		}
+
+		if (rc_manual_attitude_owner_active(now)) {
+			latch_rc_override(now, "Manual/Stabilized/Acro RC mode");
+			return;
+		}
+
+		// RELEASE之后任何Commander nav_state变化都视为飞手/系统级模式接管。
+		if (_guidance_release_nav_state_valid
+		    && _vehicle_status.nav_state != _guidance_release_nav_state) {
+			latch_rc_override(now, "vehicle nav_state changed after RELEASE");
+		}
 	}
 
 	bool release_altitude_reference_ready() const
@@ -1970,6 +2531,48 @@ private:
 		return a + (b - a) * math::constrain(t, 0.f, 1.f);
 	}
 
+	// ============================================================
+	// V22.03 post-RELEASE gimbal-protection scheduler
+	// phase=0 at RELEASE acceptance, phase=1 after 1.5s.
+	// smoothstep avoids derivative discontinuities at both ends.
+	// ============================================================
+	float gimbal_protect_phase(const uint64_t now) const
+	{
+		if (_guidance_release_time == 0 || now <= _guidance_release_time) {
+			return (_guidance_release_time == 0) ? 1.f : 0.f;
+		}
+
+		const float raw = (float)(now - _guidance_release_time) / (float)GIMBAL_PROTECT_DURATION_US;
+		return smoothstep01(raw);
+	}
+
+	void update_gimbal_protect_schedule(const uint64_t now)
+	{
+		const float p = gimbal_protect_phase(now);
+		_last_gimbal_protect_phase = p;
+		_last_gimbal_protect_axial_cap = lerp(GIMBAL_PROTECT_AXIAL_START, AXIAL_ACCEL_MAX, p);
+		_last_gimbal_protect_bpn_scale = lerp(GIMBAL_PROTECT_BPN_SCALE_START, 1.f, p);
+		_last_gimbal_protect_slew_deg_s = lerp(GIMBAL_PROTECT_SLEW_START_DEG_S, GUIDANCE_ATTITUDE_SLEW_DEG_S, p);
+	}
+
+	void start_gimbal_protect_window(const uint64_t now)
+	{
+		_guidance_release_time = now;
+		_last_gimbal_protect_phase = 0.f;
+		_last_gimbal_protect_axial_cap = GIMBAL_PROTECT_AXIAL_START;
+		_last_gimbal_protect_bpn_scale = GIMBAL_PROTECT_BPN_SCALE_START;
+		_last_gimbal_protect_slew_deg_s = GIMBAL_PROTECT_SLEW_START_DEG_S;
+	}
+
+	void reset_gimbal_protect_window()
+	{
+		_guidance_release_time = 0;
+		_last_gimbal_protect_phase = 1.f;
+		_last_gimbal_protect_axial_cap = AXIAL_ACCEL_MAX;
+		_last_gimbal_protect_bpn_scale = 1.f;
+		_last_gimbal_protect_slew_deg_s = GUIDANCE_ATTITUDE_SLEW_DEG_S;
+	}
+
 	float quat_angle_rad(const Quatf &qa, const Quatf &qb) const
 	{
 		float dot = qa(0) * qb(0) + qa(1) * qb(1) + qa(2) * qb(2) + qa(3) * qb(3);
@@ -2123,7 +2726,443 @@ private:
 		       );
 	}
 
+	bool imu_velocity_available() const
+	{
+		return _imu_velocity_initialized && _imu_velocity_valid
+		       && PX4_ISFINITE(_imu_velocity_ned(0))
+		       && PX4_ISFINITE(_imu_velocity_ned(1))
+		       && PX4_ISFINITE(_imu_velocity_ned(2));
+	}
 
+	bool get_guidance_velocity_ned(Vector3f &velocity_ned, bool *using_imu = nullptr) const
+	{
+		// V21.14: EKF reset保护优先级高于“EKF valid”标志。
+		// reset后的EKF即便仍然声明v_xy/v_z valid，也可能已经发生参考系/速度跳变；
+		// 在保护窗口内继续使用连续的IMU积分速度，回切阶段再与EKF平滑融合。
+		if (_ekf_velocity_guard_active) {
+			if (!imu_velocity_available()) {
+				// reset保护期间IMU速度也不可用时，不直接相信可能刚跳变的EKF；
+				// 返回false让上层退到固定VC_FALLBACK。
+				if (using_imu) { *using_imu = false; }
+				return false;
+			}
+
+			if (_ekf_velocity_blend_active && velocity_valid()) {
+				const Vector3f ekf_velocity{_local_position.vx, _local_position.vy, _local_position.vz};
+				const float a = math::constrain(_ekf_velocity_blend_alpha, 0.f, 1.f);
+				velocity_ned = _imu_velocity_ned * (1.f - a) + ekf_velocity * a;
+				if (using_imu) { *using_imu = a < 0.999f; }
+				return true;
+			}
+
+			velocity_ned = _imu_velocity_ned;
+			if (using_imu) { *using_imu = true; }
+			return true;
+		}
+
+		if (velocity_valid()) {
+			velocity_ned = Vector3f{_local_position.vx, _local_position.vy, _local_position.vz};
+			if (using_imu) { *using_imu = false; }
+			return true;
+		}
+
+		if (imu_velocity_available()) {
+			velocity_ned = _imu_velocity_ned;
+			if (using_imu) { *using_imu = true; }
+			return true;
+		}
+
+		if (using_imu) { *using_imu = false; }
+		return false;
+	}
+
+	float get_guidance_speed() const
+	{
+		Vector3f velocity_ned;
+		if (!get_guidance_velocity_ned(velocity_ned)) { return NAN; }
+		return velocity_ned.norm();
+	}
+
+	float get_guidance_speed_xy() const
+	{
+		Vector3f velocity_ned;
+		if (!get_guidance_velocity_ned(velocity_ned)) { return NAN; }
+		return sqrtf(velocity_ned(0) * velocity_ned(0) + velocity_ned(1) * velocity_ned(1));
+	}
+
+	const char *guidance_velocity_source_name() const
+	{
+		if (_ekf_velocity_guard_active) {
+			if (!imu_velocity_available()) { return "FIXED_RST"; }
+			return _ekf_velocity_blend_active ? "EKF_BLEND" : "IMU_RST";
+		}
+		if (velocity_valid()) { return "EKF"; }
+		if (imu_velocity_available()) { return "IMU"; }
+		return "FIXED";
+	}
+
+	void reset_ekf_velocity_guard()
+	{
+		_ekf_velocity_guard_active = false;
+		_ekf_velocity_blend_active = false;
+		_ekf_velocity_guard_timeout_warned = false;
+		_ekf_velocity_guard_start_time = 0;
+		_ekf_velocity_blend_start_time = 0;
+		_ekf_velocity_blend_alpha = 0.f;
+		_last_ekf_imu_velocity_diff = NAN;
+	}
+
+	void seed_imu_velocity(const Vector3f &velocity_ned, const uint64_t now, const bool from_ekf)
+	{
+		_imu_velocity_ned = velocity_ned;
+		_imu_velocity_initialized = true;
+		_imu_velocity_valid = PX4_ISFINITE(velocity_ned(0))
+			&& PX4_ISFINITE(velocity_ned(1))
+			&& PX4_ISFINITE(velocity_ned(2));
+		_imu_velocity_seeded_from_ekf = from_ekf;
+		_imu_velocity_anchor_time = now;
+		_imu_accel_filter_initialized = false;
+
+		const uint64_t accel_time = (_vehicle_acceleration.timestamp_sample > 0)
+			? _vehicle_acceleration.timestamp_sample : _vehicle_acceleration.timestamp;
+		_imu_velocity_last_sample_time = accel_time;
+	}
+
+	void start_ekf_velocity_guard(const uint64_t now, const Vector3f &preferred_seed, const char *reason)
+	{
+		if (!armed() || !_launch_sequence_complete) {
+			return;
+		}
+
+		Vector3f seed = preferred_seed;
+		bool seed_valid = PX4_ISFINITE(seed(0)) && PX4_ISFINITE(seed(1)) && PX4_ISFINITE(seed(2));
+
+		// 若已经处于保护中，又发生新的EKF reset，优先保持当前连续IMU速度，
+		// 绝不重新用刚发生跳变的EKF状态污染惯导速度。
+		if (_ekf_velocity_guard_active && imu_velocity_available()) {
+			seed = _imu_velocity_ned;
+			seed_valid = true;
+		} else if (!seed_valid && imu_velocity_available()) {
+			seed = _imu_velocity_ned;
+			seed_valid = true;
+		} else if (!seed_valid && velocity_valid()) {
+			seed = Vector3f{_local_position.vx, _local_position.vy, _local_position.vz};
+			seed_valid = true;
+		}
+
+		if (!seed_valid) {
+			PX4_WARN("EKF VEL GUARD requested but no velocity seed (%s)", reason ? reason : "unknown");
+			return;
+		}
+
+		seed_imu_velocity(seed, now, true);
+		_ekf_velocity_guard_active = true;
+		_ekf_velocity_blend_active = false;
+		_ekf_velocity_guard_timeout_warned = false;
+		_ekf_velocity_guard_start_time = now;
+		_ekf_velocity_blend_start_time = 0;
+		_ekf_velocity_blend_alpha = 0.f;
+		_last_ekf_imu_velocity_diff = NAN;
+
+		PX4_WARN("EKF VEL GUARD START reason=%s seed=[%.2f %.2f %.2f] hold=%.2fs max=%.2fs",
+			 reason ? reason : "unknown",
+			 (double)seed(0), (double)seed(1), (double)seed(2),
+			 (double)(EKF_RESET_IMU_HOLD_US * 1e-6f),
+			 (double)(EKF_RESET_GUARD_MAX_US * 1e-6f));
+	}
+
+	void update_ekf_velocity_guard_state(const uint64_t now)
+	{
+		if (!_ekf_velocity_guard_active || _ekf_velocity_guard_start_time == 0
+		    || now < _ekf_velocity_guard_start_time) {
+			return;
+		}
+
+		const uint64_t elapsed = now - _ekf_velocity_guard_start_time;
+
+		if (_ekf_velocity_blend_active) {
+			if (_ekf_velocity_blend_start_time == 0 || now < _ekf_velocity_blend_start_time) {
+				_ekf_velocity_blend_start_time = now;
+			}
+
+			const float blend_t = (float)(now - _ekf_velocity_blend_start_time);
+			_ekf_velocity_blend_alpha = math::constrain(
+				blend_t / (float)EKF_RESET_BLEND_BACK_US, 0.f, 1.f);
+
+			if (_ekf_velocity_blend_alpha >= 0.999f) {
+				PX4_INFO("EKF VEL GUARD END blend complete diff=%.2fm/s",
+					 (double)_last_ekf_imu_velocity_diff);
+				reset_ekf_velocity_guard();
+			}
+			return;
+		}
+
+		if (elapsed < EKF_RESET_IMU_HOLD_US) {
+			return;
+		}
+
+		if (!velocity_valid() || !imu_velocity_available()) {
+			if (elapsed >= EKF_RESET_GUARD_MAX_US && !velocity_valid()) {
+				// EKF仍无效时结束“reset专用”标志，但普通IMU fallback继续按V22.01的6s逻辑工作。
+				PX4_WARN("EKF VEL GUARD timeout with EKF invalid; continue normal IMU fallback");
+				reset_ekf_velocity_guard();
+			}
+			return;
+		}
+
+		const Vector3f ekf_velocity{_local_position.vx, _local_position.vy, _local_position.vz};
+		_last_ekf_imu_velocity_diff = (ekf_velocity - _imu_velocity_ned).norm();
+		const bool consistent = PX4_ISFINITE(_last_ekf_imu_velocity_diff)
+			&& _last_ekf_imu_velocity_diff <= EKF_REACQUIRE_MAX_DIFF_MPS;
+		const bool force_reacquire = elapsed >= EKF_RESET_GUARD_MAX_US
+			&& PX4_ISFINITE(_last_ekf_imu_velocity_diff)
+			&& _last_ekf_imu_velocity_diff <= EKF_REACQUIRE_FORCE_MAX_DIFF_MPS;
+
+		if (consistent || force_reacquire) {
+			_ekf_velocity_blend_active = true;
+			_ekf_velocity_blend_start_time = now;
+			_ekf_velocity_blend_alpha = 0.f;
+			PX4_INFO("EKF VEL GUARD BLEND start diff=%.2fm/s forced=%d duration=%.2fs",
+				 (double)_last_ekf_imu_velocity_diff, (int)force_reacquire,
+				 (double)(EKF_RESET_BLEND_BACK_US * 1e-6f));
+		} else if (elapsed >= EKF_RESET_GUARD_MAX_US && !_ekf_velocity_guard_timeout_warned) {
+			_ekf_velocity_guard_timeout_warned = true;
+			PX4_WARN("EKF VEL GUARD keeps IMU: EKF/IMU diff %.2fm/s > %.2f",
+				 (double)_last_ekf_imu_velocity_diff, (double)EKF_REACQUIRE_FORCE_MAX_DIFF_MPS);
+		}
+	}
+
+	void reset_imu_velocity_fallback()
+	{
+		_imu_velocity_ned.zero();
+		_imu_accel_ned_filtered.zero();
+		_imu_velocity_initialized = false;
+		_imu_velocity_valid = false;
+		_imu_accel_filter_initialized = false;
+		_imu_velocity_seeded_from_ekf = false;
+		_imu_velocity_anchor_time = 0;
+		_imu_velocity_last_sample_time = 0;
+		reset_ekf_velocity_guard();
+	}
+
+	void update_imu_velocity_estimator(const uint64_t now)
+	{
+		// 先推进reset保护/回切状态机。保护有效期间，即使EKF仍声明velocity_valid，
+		// 也禁止每周期把IMU速度重新锚定到已经跳变的新EKF速度。
+		update_ekf_velocity_guard_state(now);
+
+		if (!_ekf_velocity_guard_active && velocity_valid()) {
+			seed_imu_velocity(Vector3f{_local_position.vx, _local_position.vy, _local_position.vz}, now, true);
+			return;
+		}
+
+		// 如果起飞前EKF速度就无效，WAIT_RELEASE/未解锁阶段可以安全假设飞机静止，
+		// 每周期把0m/s作为最新锚点；RELEASE后不再清零，转为纯IMU短时积分。
+		if (!_ekf_velocity_guard_active
+		    && (!armed() || (_state == GuidanceState::WAIT_RELEASE && !_launch_sequence_complete))) {
+			seed_imu_velocity(Vector3f{0.f, 0.f, 0.f}, now, false);
+			return;
+		}
+
+		if (!_imu_velocity_initialized || _imu_velocity_anchor_time == 0
+		    || now < _imu_velocity_anchor_time
+		    || now - _imu_velocity_anchor_time > IMU_VEL_FALLBACK_MAX_US) {
+			_imu_velocity_valid = false;
+			return;
+		}
+
+		if (_last_accel_rx_time == 0 || now < _last_accel_rx_time
+		    || now - _last_accel_rx_time > IMU_ACCEL_TIMEOUT_US || !attitude_valid()) {
+			_imu_velocity_valid = false;
+			return;
+		}
+
+		const uint64_t sample_time = (_vehicle_acceleration.timestamp_sample > 0)
+			? _vehicle_acceleration.timestamp_sample : _vehicle_acceleration.timestamp;
+		if (sample_time == 0) {
+			_imu_velocity_valid = false;
+			return;
+		}
+
+		if (_imu_velocity_last_sample_time == 0 || sample_time <= _imu_velocity_last_sample_time) {
+			_imu_velocity_last_sample_time = sample_time;
+			return;
+		}
+
+		const float dt = (float)(sample_time - _imu_velocity_last_sample_time) * 1e-6f;
+		_imu_velocity_last_sample_time = sample_time;
+		if (!PX4_ISFINITE(dt) || dt < IMU_DT_MIN || dt > IMU_DT_MAX) {
+			_imu_velocity_valid = false;
+			return;
+		}
+
+		const Vector3f accel_body{
+			_vehicle_acceleration.xyz[0],
+			_vehicle_acceleration.xyz[1],
+			_vehicle_acceleration.xyz[2]
+		};
+		if (!PX4_ISFINITE(accel_body(0)) || !PX4_ISFINITE(accel_body(1)) || !PX4_ISFINITE(accel_body(2))) {
+			_imu_velocity_valid = false;
+			return;
+		}
+
+		const Quatf q_sample = attitude_q_at_los_sample(sample_time, now);
+		Vector3f accel_ned = Dcmf{q_sample} * accel_body + Vector3f{0.f, 0.f, GRAVITY};
+		float accel_norm = accel_ned.norm();
+		if (!PX4_ISFINITE(accel_norm)) {
+			_imu_velocity_valid = false;
+			return;
+		}
+		if (accel_norm > IMU_ACCEL_MAX_NORM && accel_norm > FLT_EPSILON) {
+			accel_ned *= IMU_ACCEL_MAX_NORM / accel_norm;
+		}
+
+		if (!_imu_accel_filter_initialized) {
+			_imu_accel_ned_filtered = accel_ned;
+			_imu_accel_filter_initialized = true;
+		} else {
+			const float alpha = math::constrain(dt / (IMU_ACCEL_LPF_TAU + dt), 0.f, 1.f);
+			_imu_accel_ned_filtered += alpha * (accel_ned - _imu_accel_ned_filtered);
+		}
+
+		_imu_velocity_ned += _imu_accel_ned_filtered * dt;
+		const float speed = _imu_velocity_ned.norm();
+		if (!PX4_ISFINITE(speed)) {
+			_imu_velocity_valid = false;
+			return;
+		}
+		if (speed > IMU_VELOCITY_MAX && speed > FLT_EPSILON) {
+			_imu_velocity_ned *= IMU_VELOCITY_MAX / speed;
+		}
+		_imu_velocity_valid = true;
+	}
+
+
+
+	// ============================================================
+	// V22.06 gimbal-load supervisor
+	// ============================================================
+	float normalize_gimbal_load_component(const float value, const float safe, const float critical) const
+	{
+		if (!PX4_ISFINITE(value) || critical <= safe) { return 0.f; }
+		const float u = math::constrain((value - safe) / (critical - safe), 0.f, 1.f);
+		return smoothstep01(u);
+	}
+
+	bool attitude_reset_guard_active(const uint64_t now) const
+	{
+		return _attitude_reset_guard_until > 0 && now < _attitude_reset_guard_until;
+	}
+
+	void update_gimbal_load_state_hysteresis()
+	{
+		switch (_gimbal_load_state) {
+		case GimbalLoadState::NORMAL:
+			if (_gimbal_load >= GIMBAL_LOAD_CAUTION_ENTER) { _gimbal_load_state = GimbalLoadState::CAUTION; }
+			break;
+		case GimbalLoadState::CAUTION:
+			if (_gimbal_load >= GIMBAL_LOAD_HIGH_ENTER) { _gimbal_load_state = GimbalLoadState::HIGH; }
+			else if (_gimbal_load <= GIMBAL_LOAD_CAUTION_EXIT) { _gimbal_load_state = GimbalLoadState::NORMAL; }
+			break;
+		case GimbalLoadState::HIGH:
+			if (_gimbal_load >= GIMBAL_LOAD_CRITICAL_ENTER) { _gimbal_load_state = GimbalLoadState::CRITICAL; }
+			else if (_gimbal_load <= GIMBAL_LOAD_HIGH_EXIT) { _gimbal_load_state = GimbalLoadState::CAUTION; }
+			break;
+		case GimbalLoadState::CRITICAL:
+			if (_gimbal_load <= GIMBAL_LOAD_CRITICAL_EXIT) { _gimbal_load_state = GimbalLoadState::HIGH; }
+			break;
+		}
+	}
+
+	void update_gimbal_load_supervisor(const uint64_t now)
+	{
+		// Update only when a new gimbal/vision packet has been accepted.
+		if (_last_los_rx_time == 0 || _last_los_rx_time == _gimbal_load_last_los_rx_time) { return; }
+		_gimbal_load_last_los_rx_time = _last_los_rx_time;
+
+		float dt = LOOP_INTERVAL_US * 1e-6f;
+		if (_gimbal_load_last_update_time > 0 && now > _gimbal_load_last_update_time) {
+			dt = math::constrain((float)(now - _gimbal_load_last_update_time) * 1e-6f, 0.005f, 0.10f);
+		}
+		_gimbal_load_last_update_time = now;
+
+		// Off-axis angle of the actual gimbal boresight relative to the zero-gimbal Body -Z boresight.
+		const Vector3f center_guidance = calculate_los_body(_los.gimbal_roll, _los.gimbal_pitch, 0.f, 0.f);
+		const Vector3f center_body = guidance_to_px4_body(center_guidance);
+		const Vector3f zero_body{0.f, 0.f, -1.f};
+		_gimbal_offaxis_deg = vector_angle_deg(center_body, zero_body);
+
+		const float rate_mag_rad_s = sqrtf(_gimbal_az_rate_filtered * _gimbal_az_rate_filtered
+			+ _gimbal_pitch_rate_filtered * _gimbal_pitch_rate_filtered);
+		_gimbal_rate_mag_deg_s = PX4_ISFINITE(rate_mag_rad_s) ? rate_mag_rad_s * 180.f / M_PI_F : 0.f;
+
+		float accel_mag_deg_s2 = 0.f;
+		if (_gimbal_load_rate_initialized && dt > 0.f) {
+			const float daz = (_gimbal_az_rate_filtered - _gimbal_load_prev_az_rate) / dt;
+			const float dp = (_gimbal_pitch_rate_filtered - _gimbal_load_prev_pitch_rate) / dt;
+			const float accel_mag_rad_s2 = sqrtf(daz * daz + dp * dp);
+			if (PX4_ISFINITE(accel_mag_rad_s2)) { accel_mag_deg_s2 = accel_mag_rad_s2 * 180.f / M_PI_F; }
+		}
+		_gimbal_load_prev_az_rate = _gimbal_az_rate_filtered;
+		_gimbal_load_prev_pitch_rate = _gimbal_pitch_rate_filtered;
+		_gimbal_load_rate_initialized = true;
+		_gimbal_accel_mag_deg_s2 = accel_mag_deg_s2;
+
+		const float alpha_acc = dt / (GIMBAL_LOAD_ACCEL_LPF_TAU + dt);
+		_gimbal_accel_mag_filtered_deg_s2 += alpha_acc * (accel_mag_deg_s2 - _gimbal_accel_mag_filtered_deg_s2);
+
+		const float l_theta = normalize_gimbal_load_component(_gimbal_offaxis_deg,
+			GIMBAL_LOAD_OFFAXIS_SAFE_DEG, GIMBAL_LOAD_OFFAXIS_CRITICAL_DEG);
+		const float l_rate = normalize_gimbal_load_component(_gimbal_rate_mag_deg_s,
+			GIMBAL_LOAD_RATE_SAFE_DEG_S, GIMBAL_LOAD_RATE_CRITICAL_DEG_S);
+		const float l_acc = normalize_gimbal_load_component(_gimbal_accel_mag_filtered_deg_s2,
+			GIMBAL_LOAD_ACCEL_SAFE_DEG_S2, GIMBAL_LOAD_ACCEL_CRITICAL_DEG_S2);
+
+		// Geometry risk and dynamic load must not be treated as the same thing.  A large off-axis angle with
+		// low gimbal rate is a field-of-regard warning, but blindly reducing axial acceleration can actually
+		// reduce body tilt and make the off-axis angle larger.  Therefore control scheduling is driven by
+		// rate/acceleration, with off-axis only amplifying an already-dynamic condition.
+		_gimbal_geometry_load = l_theta;
+		_gimbal_dynamic_load = fmaxf(l_rate, l_acc);
+		_gimbal_load_raw = fmaxf(_gimbal_geometry_load, _gimbal_dynamic_load);
+
+		const float alpha_load = dt / (GIMBAL_LOAD_LPF_TAU + dt);
+		_gimbal_load += alpha_load * (_gimbal_load_raw - _gimbal_load);
+		_gimbal_load = math::constrain(_gimbal_load, 0.f, 1.f);
+		update_gimbal_load_state_hysteresis();
+
+		// Control load: dynamic stress is primary.  Large off-axis geometry can raise its severity by up to 35%,
+		// but geometry alone never commands the aircraft to slow down.
+		_gimbal_control_load = math::constrain(
+			_gimbal_dynamic_load * (1.f + 0.35f * _gimbal_geometry_load), 0.f, 1.f);
+
+		// In the dynamically safe region the supervisor is intentionally transparent even if geometric off-axis
+		// is large.  The latter is logged as a risk that requires future body/gimbal unloading logic.
+		if (_gimbal_control_load <= GIMBAL_LOAD_NO_ACTION) {
+			_gimbal_supervisor_axial_cap = AXIAL_ACCEL_MAX;
+			_gimbal_supervisor_slew_cap_deg_s = GUIDANCE_ATTITUDE_SLEW_HIGH_DEG_S;
+			_gimbal_supervisor_lead_cap_deg = GUIDANCE_ATTITUDE_LEAD_MAX_DEG;
+			return;
+		}
+
+		const float u = math::constrain((_gimbal_control_load - GIMBAL_LOAD_NO_ACTION)
+			/ fmaxf(1.f - GIMBAL_LOAD_NO_ACTION, 0.01f), 0.f, 1.f);
+		const float us = smoothstep01(u);
+		_gimbal_supervisor_axial_cap = lerp(AXIAL_ACCEL_MAX, GIMBAL_SUPERVISOR_AXIAL_MIN, us);
+		_gimbal_supervisor_slew_cap_deg_s = lerp(GUIDANCE_ATTITUDE_SLEW_HIGH_DEG_S,
+			GIMBAL_SUPERVISOR_SLEW_MIN_DEG_S, us);
+
+		// Lead is intentionally tightened more strongly only after dynamic load has clearly left the safe region.
+		if (_gimbal_control_load <= 0.65f) {
+			const float ul = math::constrain((_gimbal_control_load - GIMBAL_LOAD_NO_ACTION) / (0.65f - GIMBAL_LOAD_NO_ACTION), 0.f, 1.f);
+			_gimbal_supervisor_lead_cap_deg = lerp(GUIDANCE_ATTITUDE_LEAD_MAX_DEG,
+				GIMBAL_SUPERVISOR_LEAD_HIGH_DEG, smoothstep01(ul));
+		} else {
+			const float ul = math::constrain((_gimbal_control_load - 0.65f) / 0.35f, 0.f, 1.f);
+			_gimbal_supervisor_lead_cap_deg = lerp(GIMBAL_SUPERVISOR_LEAD_HIGH_DEG,
+				GIMBAL_SUPERVISOR_LEAD_CRITICAL_DEG, smoothstep01(ul));
+		}
+	}
 
 	// ============================================================
 	// Guidance/光轴坐标 -> PX4标准Body FRD
@@ -2380,6 +3419,9 @@ private:
 		_miss_history_count = 0;
 		_diag_miss_az_rate_px4 = 0.f;
 		_diag_miss_el_rate_px4 = 0.f;
+		_diag_miss_az_rate_backward3 = 0.f;
+		_diag_miss_el_rate_backward3 = 0.f;
+		_diag_miss_rate_mode = 0;
 		_diag_miss_rate_valid = false;
 	}
 
@@ -2480,6 +3522,143 @@ private:
 		return PX4_ISFINITE(az_rate_out) && PX4_ISFINITE(el_rate_out);
 	}
 
+	// V21.12: small pivoted Gaussian elimination for the 3x3 normal equation used by causal quadratic fit.
+	bool solve_3x3(float A[3][3], float b[3], float x[3]) const
+	{
+		float aug[3][4]{};
+		for (int r = 0; r < 3; ++r) {
+			for (int c = 0; c < 3; ++c) { aug[r][c] = A[r][c]; }
+			aug[r][3] = b[r];
+		}
+		for (int col = 0; col < 3; ++col) {
+			int pivot = col;
+			float pivot_abs = fabsf(aug[col][col]);
+			for (int r = col + 1; r < 3; ++r) {
+				const float a = fabsf(aug[r][col]);
+				if (a > pivot_abs) { pivot_abs = a; pivot = r; }
+			}
+			if (!PX4_ISFINITE(pivot_abs) || pivot_abs < 1e-7f) { return false; }
+			if (pivot != col) {
+				for (int c = col; c < 4; ++c) { const float tmp = aug[col][c]; aug[col][c] = aug[pivot][c]; aug[pivot][c] = tmp; }
+			}
+			const float inv = 1.f / aug[col][col];
+			for (int c = col; c < 4; ++c) { aug[col][c] *= inv; }
+			for (int r = 0; r < 3; ++r) {
+				if (r == col) { continue; }
+				const float f = aug[r][col];
+				for (int c = col; c < 4; ++c) { aug[r][c] -= f * aug[col][c]; }
+			}
+		}
+		for (int i = 0; i < 3; ++i) { x[i] = aug[i][3]; }
+		return PX4_ISFINITE(x[0]) && PX4_ISFINITE(x[1]) && PX4_ISFINITE(x[2]);
+	}
+
+	// V21.12: six-sample causal quadratic least-squares derivative evaluated at the newest capture time.
+	// It uses no future image sample. Actual capture timestamps are used, so 50Hz jitter does not bias the derivative.
+	bool miss_rate_at_time_causal_polyfit(const uint64_t sample_time, float &az_rate_out, float &el_rate_out) const
+	{
+		if (sample_time == 0 || _miss_history_count < MISS_RATE_POLYFIT_POINTS) { return false; }
+
+		MissHistorySample selected[MISS_RATE_POLYFIT_POINTS]{};
+		uint8_t selected_count = 0;
+		// Repeatedly select the newest sample <= cursor. N=6 and history=32, so this is cheap at 50Hz.
+		uint64_t cursor = sample_time;
+		for (uint8_t n = 0; n < MISS_RATE_POLYFIT_POINTS; ++n) {
+			const MissHistorySample *best = nullptr;
+			for (uint8_t i = 0; i < _miss_history_count; ++i) {
+				const MissHistorySample &m = _miss_history[i];
+				if (m.t > 0 && m.t <= cursor && (best == nullptr || m.t > best->t)) { best = &m; }
+			}
+			if (best == nullptr) { return false; }
+			selected[MISS_RATE_POLYFIT_POINTS - 1U - n] = *best;
+			selected_count++;
+			if (best->t == 0) { return false; }
+			cursor = best->t - 1ULL;
+		}
+		if (selected_count != MISS_RATE_POLYFIT_POINTS) { return false; }
+
+		for (uint8_t i = 1; i < MISS_RATE_POLYFIT_POINTS; ++i) {
+			if (selected[i].t <= selected[i - 1].t) { return false; }
+			const uint64_t gap = selected[i].t - selected[i - 1].t;
+			if (gap > MISS_INTERP_MAX_GAP_US) { return false; }
+		}
+		const float mean_step_s = (selected[MISS_RATE_POLYFIT_POINTS - 1U].t - selected[0].t)
+			* 1e-6f / (float)(MISS_RATE_POLYFIT_POINTS - 1U);
+		if (!PX4_ISFINITE(mean_step_s) || mean_step_s < 0.008f || mean_step_s > 0.040f) { return false; }
+
+		float az_unwrapped[MISS_RATE_POLYFIT_POINTS]{};
+		az_unwrapped[MISS_RATE_POLYFIT_POINTS - 1U] = selected[MISS_RATE_POLYFIT_POINTS - 1U].azimuth;
+		for (int i = (int)MISS_RATE_POLYFIT_POINTS - 2; i >= 0; --i) {
+			const float d = atan2f(sinf(selected[i].azimuth - selected[i + 1].azimuth),
+					       cosf(selected[i].azimuth - selected[i + 1].azimuth));
+			az_unwrapped[i] = az_unwrapped[i + 1] + d;
+		}
+
+		float S0 = 0.f, S1 = 0.f, S2 = 0.f, S3 = 0.f, S4 = 0.f;
+		float Yaz0 = 0.f, Yaz1 = 0.f, Yaz2 = 0.f;
+		float Yel0 = 0.f, Yel1 = 0.f, Yel2 = 0.f;
+		const uint64_t t_ref = selected[MISS_RATE_POLYFIT_POINTS - 1U].t;
+
+		for (uint8_t i = 0; i < MISS_RATE_POLYFIT_POINTS; ++i) {
+			const float u = ((int64_t)selected[i].t - (int64_t)t_ref) * 1e-6f / mean_step_s;
+			const float u2 = u * u;
+			S0 += 1.f; S1 += u; S2 += u2; S3 += u2 * u; S4 += u2 * u2;
+			Yaz0 += az_unwrapped[i]; Yaz1 += u * az_unwrapped[i]; Yaz2 += u2 * az_unwrapped[i];
+			Yel0 += selected[i].elevation; Yel1 += u * selected[i].elevation; Yel2 += u2 * selected[i].elevation;
+		}
+
+		float Aaz[3][3]{{S0, S1, S2}, {S1, S2, S3}, {S2, S3, S4}};
+		float Ael[3][3]{{S0, S1, S2}, {S1, S2, S3}, {S2, S3, S4}};
+		float baz[3]{Yaz0, Yaz1, Yaz2};
+		float bel[3]{Yel0, Yel1, Yel2};
+		float xaz[3]{};
+		float xel[3]{};
+		if (!solve_3x3(Aaz, baz, xaz) || !solve_3x3(Ael, bel, xel)) { return false; }
+
+		az_rate_out = xaz[1] / mean_step_s;
+		el_rate_out = xel[1] / mean_step_s;
+		return PX4_ISFINITE(az_rate_out) && PX4_ISFINITE(el_rate_out);
+	}
+
+	// V21.10: 在当前capture时刻使用三点后向二阶差分，避免中心差分必须等待“未来20ms”而把observer再退后20ms。
+	// f'(t) ~= [3f(t)-4f(t-h)+f(t-2h)]/(2h)。az使用逐段最短角差展开，避免跨+-pi时跳变。
+	bool miss_rate_at_time_backward(const uint64_t sample_time, float &az_rate_out, float &el_rate_out) const
+	{
+		const uint64_t h_us = MISS_RATE_BACKWARD_STEP_US;
+
+		if (sample_time <= 2ULL * h_us) {
+			return false;
+		}
+
+		float az0 = 0.f, el0 = 0.f;
+		float az1 = 0.f, el1 = 0.f;
+		float az2 = 0.f, el2 = 0.f;
+		int64_t err0 = 0, err1 = 0, err2 = 0;
+		bool interp0 = false, interp1 = false, interp2 = false;
+
+		if (!miss_at_time(sample_time, az0, el0, err0, interp0)
+		    || !miss_at_time(sample_time - h_us, az1, el1, err1, interp1)
+		    || !miss_at_time(sample_time - 2ULL * h_us, az2, el2, err2, interp2)) {
+			return false;
+		}
+
+		// 将历史az围绕当前az连续展开。
+		const float d01 = atan2f(sinf(az0 - az1), cosf(az0 - az1));
+		const float az1_unwrapped = az0 - d01;
+		const float d12 = atan2f(sinf(az1 - az2), cosf(az1 - az2));
+		const float az2_unwrapped = az1_unwrapped - d12;
+
+		const float h = (float)h_us * 1e-6f;
+		if (!PX4_ISFINITE(h) || h <= FLT_EPSILON) {
+			return false;
+		}
+
+		az_rate_out = (3.f * az0 - 4.f * az1_unwrapped + az2_unwrapped) / (2.f * h);
+		el_rate_out = (3.f * el0 - 4.f * el1 + el2) / (2.f * h);
+
+		return PX4_ISFINITE(az_rate_out) && PX4_ISFINITE(el_rate_out);
+	}
+
 	bool update_los_from_cgtd070(const cgtd070_status_s &src, const uint64_t now)
 	{
 		// 【V21修改】先定义当前CGTD070完整包解析完成的RX-HRT；真机图像capture仍固定认为比RX早100ms。
@@ -2543,8 +3722,9 @@ private:
 		// 【V21修改】把当前有效direct miss写入capture时间轴历史，作为PX4自行重构IMG角速度的唯一正式视觉输入。
 		push_miss_history(capture_time, miss_az_capture, miss_el_capture);
 
-		// 【V21修改】40ms中心差分的rate代表窗口中点，因此正式observer时刻取capture_time-20ms。
-		if (capture_time <= MISS_RATE_CENTER_HALF_WINDOW_US) {
+		// V21.12: observer仍直接位于capture_time。正式miss-rate优先使用6点因果二次最小二乘端点导数；
+		// 重捕获初期历史不足时回退三点后向差分，因此仍只要求至少3帧即可启动。
+		if (capture_time <= 2ULL * MISS_RATE_BACKWARD_STEP_US) {
 			_los = vehicle_target_los_s{};
 			_los.timestamp = capture_time;
 			_los.target_valid = false;
@@ -2554,9 +3734,9 @@ private:
 			return false;
 		}
 
-		const uint64_t observer_time = capture_time - MISS_RATE_CENTER_HALF_WINDOW_US;
+		const uint64_t observer_time = capture_time;
 
-		// 【V21修改】在observer_time插值miss角，并用observer_time±20ms中心差分重构PX4 miss-rate；板卡raw rate不再参与。
+		// V21.12: miss角与formal miss-rate都严格标记为capture_time；板卡raw rate继续只作诊断。
 		float miss_az_observer = 0.f;
 		float miss_el_observer = 0.f;
 		int64_t miss_align_error_us = 0;
@@ -2568,7 +3748,7 @@ private:
 			miss_at_time(observer_time, miss_az_observer, miss_el_observer,
 				     miss_align_error_us, miss_interpolated);
 		const bool miss_rate_ok =
-			miss_rate_at_time_centered(observer_time, miss_az_rate_px4, miss_el_rate_px4);
+			miss_rate_at_time_robust(observer_time, miss_az_rate_px4, miss_el_rate_px4);
 
 		_diag_miss_az_rate_px4 = miss_az_rate_px4;
 		_diag_miss_el_rate_px4 = miss_el_rate_px4;
@@ -2595,7 +3775,7 @@ private:
 			return false;
 		}
 
-		// 【V21修改】从这里开始_los全部表示observer_time：miss、PX4 miss-rate和gimbal角严格同一时间基准。
+		// V21.10: 从这里开始_los全部表示capture_time：miss、PX4 miss-rate、gimbal角与body gyro严格同一物理时刻。
 		_los.timestamp = observer_time;
 		_los.target_valid = true;
 		_los.los_az_rate = miss_az_rate_px4;
@@ -2608,6 +3788,31 @@ private:
 		_last_los_rx_time = now;
 		update_inertial_los_rate(now);
 		return true;
+	}
+
+	// V21.12 formal miss-rate selection: poly6 when history is established, backward3 only during bootstrap/reacquire.
+	bool miss_rate_at_time_robust(const uint64_t sample_time, float &az_rate_out, float &el_rate_out)
+	{
+		float back_az = 0.f, back_el = 0.f;
+		const bool back_ok = miss_rate_at_time_backward(sample_time, back_az, back_el);
+		_diag_miss_az_rate_backward3 = back_ok ? back_az : 0.f;
+		_diag_miss_el_rate_backward3 = back_ok ? back_el : 0.f;
+
+		float poly_az = 0.f, poly_el = 0.f;
+		if (miss_rate_at_time_causal_polyfit(sample_time, poly_az, poly_el)) {
+			az_rate_out = poly_az;
+			el_rate_out = poly_el;
+			_diag_miss_rate_mode = 2;
+			return true;
+		}
+		if (back_ok) {
+			az_rate_out = back_az;
+			el_rate_out = back_el;
+			_diag_miss_rate_mode = 1;
+			return true;
+		}
+		_diag_miss_rate_mode = 0;
+		return false;
 	}
 
 	bool calculate_raw_image_los_dot_body(Vector3f &los_dot_image_body) const
@@ -2694,8 +3899,32 @@ private:
 		_los_dot_gimbal_body.zero();
 		_los_dot_body_motion.zero();
 		_los_dot_fused_raw_body.zero();
+		_los_dot_inertial_lpf_body.zero();
 		_los_dot_inertial_body.zero();
 		_los_rate_filter_initialized = false;
+		reset_los_rate_notch();
+		_los_control_body = Vector3f{0.f, 0.f, -1.f};
+		_los_dot_control_body.zero();
+		_los_prediction_valid = false;
+		_los_prediction_age_us = 0;
+		_los_prediction_angle_deg = 0.f;
+		_shadow_los_initialized = false;
+		_shadow_los_rate_valid = false;
+		_shadow_los_rate_filter_initialized = false;
+		_shadow_prev_sample_time = 0;
+		_shadow_dt_s = 0.f;
+		_shadow_residual_angle_deg = 0.f;
+		_shadow_filter_alpha = 0.f;
+		_shadow_prev_los_body = Vector3f{0.f, 0.f, -1.f};
+		_shadow_los_dot_raw_body.zero();
+		_shadow_los_dot_filt_body.zero();
+		_shadow_prediction_valid = false;
+		_shadow_prediction_age_us = 0;
+		_shadow_prediction_angle_deg = 0.f;
+		_shadow_los_pred_body = Vector3f{0.f, 0.f, -1.f};
+		_shadow_los_dot_pred_body.zero();
+		_shadow_formal_rate_angle_deg = 0.f;
+		_shadow_formal_pred_angle_deg = 0.f;
 		_diag_gimbal_delta_az = 0.f;
 		_diag_gimbal_delta_pitch = 0.f;
 		_diag_gimbal_az_rate_raw = 0.f;
@@ -2705,6 +3934,9 @@ private:
 		// 【V21修改】observer reset只清当前PX4 miss-rate有效标志；miss历史是否清空由目标有效性入口单独决定。
 		_diag_miss_az_rate_px4 = 0.f;
 		_diag_miss_el_rate_px4 = 0.f;
+		_diag_miss_az_rate_backward3 = 0.f;
+		_diag_miss_el_rate_backward3 = 0.f;
+		_diag_miss_rate_mode = 0;
 		_diag_miss_rate_valid = false;
 		_los_reacquire_active = false;
 		_los_reacquire_start_time = 0;
@@ -2732,8 +3964,32 @@ private:
 		_los_dot_gimbal_body.zero();
 		_los_dot_body_motion.zero();
 		_los_dot_fused_raw_body.zero();
+		_los_dot_inertial_lpf_body.zero();
 		_los_dot_inertial_body.zero();
 		_los_rate_filter_initialized = false;
+		reset_los_rate_notch();
+		_los_control_body = Vector3f{0.f, 0.f, -1.f};
+		_los_dot_control_body.zero();
+		_los_prediction_valid = false;
+		_los_prediction_age_us = 0;
+		_los_prediction_angle_deg = 0.f;
+		_shadow_los_initialized = false;
+		_shadow_los_rate_valid = false;
+		_shadow_los_rate_filter_initialized = false;
+		_shadow_prev_sample_time = 0;
+		_shadow_dt_s = 0.f;
+		_shadow_residual_angle_deg = 0.f;
+		_shadow_filter_alpha = 0.f;
+		_shadow_prev_los_body = Vector3f{0.f, 0.f, -1.f};
+		_shadow_los_dot_raw_body.zero();
+		_shadow_los_dot_filt_body.zero();
+		_shadow_prediction_valid = false;
+		_shadow_prediction_age_us = 0;
+		_shadow_prediction_angle_deg = 0.f;
+		_shadow_los_pred_body = Vector3f{0.f, 0.f, -1.f};
+		_shadow_los_dot_pred_body.zero();
+		_shadow_formal_rate_angle_deg = 0.f;
+		_shadow_formal_pred_angle_deg = 0.f;
 		_diag_gimbal_delta_az = 0.f;
 		_diag_gimbal_delta_pitch = 0.f;
 		_diag_gimbal_az_rate_raw = 0.f;
@@ -2743,6 +3999,9 @@ private:
 		// 【V21修改】重播种时清当前PX4 miss-rate有效标志，但保留历史，下一有效帧可继续按统一时间轴重建。
 		_diag_miss_az_rate_px4 = 0.f;
 		_diag_miss_el_rate_px4 = 0.f;
+		_diag_miss_az_rate_backward3 = 0.f;
+		_diag_miss_el_rate_backward3 = 0.f;
+		_diag_miss_rate_mode = 0;
 		_diag_miss_rate_valid = false;
 		_los_reacquire_active = true;
 		_los_reacquire_start_time = now;
@@ -2818,7 +4077,7 @@ private:
 	uint64_t los_measurement_time(const uint64_t now)
 	{
 		// 【V21修改】内部_los.timestamp始终位于PX4 HRT时钟域：SITL沿用上游sample timestamp；
-		// 真机为observer_time = capture_time - 20ms，其中capture_time = CGTD070 RX-HRT - 固定100ms。
+		// 真机V21.10为observer_time = capture_time，其中capture_time = CGTD070 RX-HRT - 固定100ms；随后预测到now。
 		if (_los.timestamp > 0 && _los.timestamp <= now && now - _los.timestamp <= LOS_TIMEOUT_US) {
 			_last_los_sample_time = _los.timestamp;
 			_last_los_sample_age_us = now - _los.timestamp;
@@ -2932,6 +4191,10 @@ private:
 		los_body /= los_norm;
 		_diag_los_body = los_body;
 
+		// V21.12 shadow observer consumes the same capture-time complete LOS and gyro history.
+		// It is diagnostic-only and never changes _los_dot_inertial_body or any control output.
+		update_full_los_shadow_observer(sample_time, los_body);
+
 		// 【V20.9修改】第一帧建立capture对齐后的gimbal/body-rate基准；云台正式rate后续优先由历史中心差分得到。
 		if (!_los_recon_initialized) {
 			_prev_los_body = los_body;
@@ -2949,8 +4212,10 @@ private:
 			_diag_gimbal_pitch_rate_raw = 0.f;
 			_diag_omega_aligned = omega_now_valid ? omega_now : Vector3f{0.f, 0.f, 0.f};
 			_los_dot_fused_raw_body.zero();
+			_los_dot_inertial_lpf_body.zero();
 			_los_dot_inertial_body.zero();
 			_los_rate_filter_initialized = true;
+			reset_los_rate_notch();
 
 			if (omega_now_valid) {
 				_prev_body_rate_at_los = omega_now;
@@ -2986,8 +4251,10 @@ private:
 			_diag_gimbal_pitch_rate_raw = 0.f;
 			_diag_omega_aligned = omega_now_valid ? omega_now : Vector3f{0.f, 0.f, 0.f};
 			_los_dot_fused_raw_body.zero();
+			_los_dot_inertial_lpf_body.zero();
 			_los_dot_inertial_body.zero();
 			_los_rate_filter_initialized = true;
+			reset_los_rate_notch();
 			return;
 		}
 
@@ -3038,13 +4305,20 @@ private:
 		_los_dot_fused_raw_body = _los_dot_image_body + _los_dot_gimbal_body + _los_dot_body_motion;
 		_los_dot_fused_raw_body -= los_body * _los_dot_fused_raw_body.dot(los_body);
 
-		// 【V20.9保留】最终25ms IN低通本轮故意不改，只单独验证100ms时间对齐+云台中心差分对FRAW/IN的改善。
+		// V21.12: final causal LOS-rate LPF. poly6端点拟合负责主要降噪，因此tau保持10ms降低相位。
 		const float los_rate_alpha = math::constrain(dt / (INERTIAL_LOS_RATE_LPF_TAU + dt), 0.f, 1.f);
 		if (!_los_rate_filter_initialized) {
+			_los_dot_inertial_lpf_body.zero();
 			_los_dot_inertial_body.zero();
 			_los_rate_filter_initialized = true;
+			reset_los_rate_notch();
 		}
-		_los_dot_inertial_body += los_rate_alpha * (_los_dot_fused_raw_body - _los_dot_inertial_body);
+		_los_dot_inertial_lpf_body += los_rate_alpha * (_los_dot_fused_raw_body - _los_dot_inertial_lpf_body);
+		_los_dot_inertial_lpf_body -= los_body * _los_dot_inertial_lpf_body.dot(los_body);
+
+		// V22.02: 4Hz narrow-band notch after the low-latency LPF.
+		// The filtered vector is projected back to the LOS tangent plane after the biquad.
+		_los_dot_inertial_body = apply_los_rate_notch(_los_dot_inertial_lpf_body);
 		_los_dot_inertial_body -= los_body * _los_dot_inertial_body.dot(los_body);
 
 		_inertial_los_rate_valid =
@@ -3069,6 +4343,550 @@ private:
 	}
 
 
+	// V21.10: 将“某个惯性向量在sample_time时刻的Body坐标”传播到now时刻的Body坐标。
+	// 对固定惯性向量v有 dv_B/dt = -omega_B x v_B；使用body-rate历史按<=5ms小步Rodrigues积分。
+	bool propagate_inertial_vector_body_to_now(const uint64_t sample_time, const uint64_t now,
+						  const Vector3f &v_body_sample, Vector3f &v_body_now) const
+	{
+		if (sample_time == 0 || now < sample_time || now - sample_time > LOS_PREDICT_MAX_US
+		    || !PX4_ISFINITE(v_body_sample(0)) || !PX4_ISFINITE(v_body_sample(1)) || !PX4_ISFINITE(v_body_sample(2))) {
+			return false;
+		}
+
+		v_body_now = v_body_sample;
+		uint64_t t = sample_time;
+
+		while (t < now) {
+			const uint64_t remaining = now - t;
+			const uint64_t step_us = remaining > LOS_PREDICT_INTEGRATION_STEP_US
+				? LOS_PREDICT_INTEGRATION_STEP_US : remaining;
+			const uint64_t t_next = t + step_us;
+			const uint64_t t_mid = t + step_us / 2ULL;
+
+			Vector3f omega_body{0.f, 0.f, 0.f};
+			int64_t align_error_us = 0;
+			bool interpolated = false;
+
+			if (!body_rate_at_time(t_mid, omega_body, align_error_us, interpolated)) {
+				return false;
+			}
+
+			const float dt = (float)step_us * 1e-6f;
+			v_body_now = rotate_vector_rodrigues(v_body_now, omega_body * (-dt));
+
+			if (!PX4_ISFINITE(v_body_now(0)) || !PX4_ISFINITE(v_body_now(1)) || !PX4_ISFINITE(v_body_now(2))) {
+				return false;
+			}
+
+			t = t_next;
+		}
+
+		return true;
+	}
+
+	// ============================================================
+	// V21.12 complete-LOS discrete observer (shadow only)
+	// ============================================================
+	void update_full_los_shadow_observer(const uint64_t sample_time, const Vector3f &los_body_sample)
+	{
+		_shadow_los_rate_valid = false;
+		_shadow_dt_s = 0.f;
+		_shadow_residual_angle_deg = 0.f;
+		_shadow_filter_alpha = 0.f;
+
+		const float sample_norm = los_body_sample.norm();
+		if (sample_time == 0 || !PX4_ISFINITE(sample_norm) || sample_norm <= FLT_EPSILON) {
+			_shadow_los_initialized = false;
+			_shadow_los_rate_filter_initialized = false;
+			return;
+		}
+
+		Vector3f los_now = los_body_sample / sample_norm;
+
+		if (!_shadow_los_initialized || _shadow_prev_sample_time == 0 || sample_time <= _shadow_prev_sample_time) {
+			_shadow_prev_sample_time = sample_time;
+			_shadow_prev_los_body = los_now;
+			_shadow_los_dot_raw_body.zero();
+			_shadow_los_dot_filt_body.zero();
+			_shadow_los_rate_filter_initialized = false;
+			_shadow_los_initialized = true;
+			return;
+		}
+
+		const float dt = (sample_time - _shadow_prev_sample_time) * 1e-6f;
+		_shadow_dt_s = dt;
+		if (!PX4_ISFINITE(dt) || dt < LOS_RECON_DT_MIN || dt > LOS_RECON_DT_MAX) {
+			_shadow_prev_sample_time = sample_time;
+			_shadow_prev_los_body = los_now;
+			_shadow_los_rate_filter_initialized = false;
+			return;
+		}
+
+		Vector3f prev_fixed_at_now{0.f, 0.f, 0.f};
+		if (!propagate_inertial_vector_body_to_now(_shadow_prev_sample_time, sample_time,
+						       _shadow_prev_los_body, prev_fixed_at_now)) {
+			_shadow_prev_sample_time = sample_time;
+			_shadow_prev_los_body = los_now;
+			_shadow_los_rate_filter_initialized = false;
+			return;
+		}
+
+		const float prev_norm = prev_fixed_at_now.norm();
+		if (!PX4_ISFINITE(prev_norm) || prev_norm <= FLT_EPSILON) {
+			_shadow_prev_sample_time = sample_time;
+			_shadow_prev_los_body = los_now;
+			_shadow_los_rate_filter_initialized = false;
+			return;
+		}
+		prev_fixed_at_now /= prev_norm;
+
+		const Vector3f cross_v = prev_fixed_at_now.cross(los_now);
+		const float cross_norm = cross_v.norm();
+		const float dot_v = math::constrain(prev_fixed_at_now.dot(los_now), -1.f, 1.f);
+		const float angle = atan2f(cross_norm, dot_v);
+		_shadow_residual_angle_deg = angle * 180.f / M_PI_F;
+
+		Vector3f rate_raw{0.f, 0.f, 0.f};
+		if (PX4_ISFINITE(angle) && angle > SHADOW_LOS_MIN_ANGLE_RAD && cross_norm > FLT_EPSILON) {
+			const Vector3f axis = cross_v / cross_norm;
+			const Vector3f omega_los = axis * (angle / dt);
+			rate_raw = omega_los.cross(los_now);
+		} else {
+			rate_raw = (los_now - prev_fixed_at_now) / dt;
+		}
+
+		rate_raw -= los_now * rate_raw.dot(los_now);
+		if (!PX4_ISFINITE(rate_raw(0)) || !PX4_ISFINITE(rate_raw(1)) || !PX4_ISFINITE(rate_raw(2))) {
+			_shadow_prev_sample_time = sample_time;
+			_shadow_prev_los_body = los_now;
+			_shadow_los_rate_filter_initialized = false;
+			return;
+		}
+		_shadow_los_dot_raw_body = rate_raw;
+
+		const float alpha = math::constrain(dt / (SHADOW_LOS_RATE_LPF_TAU + dt), 0.f, 1.f);
+		_shadow_filter_alpha = alpha;
+		if (!_shadow_los_rate_filter_initialized) {
+			_shadow_los_dot_filt_body = rate_raw;
+			_shadow_los_rate_filter_initialized = true;
+		} else {
+			_shadow_los_dot_filt_body += alpha * (rate_raw - _shadow_los_dot_filt_body);
+		}
+		_shadow_los_dot_filt_body -= los_now * _shadow_los_dot_filt_body.dot(los_now);
+		_shadow_los_rate_valid = PX4_ISFINITE(_shadow_los_dot_filt_body(0))
+			&& PX4_ISFINITE(_shadow_los_dot_filt_body(1))
+			&& PX4_ISFINITE(_shadow_los_dot_filt_body(2));
+
+		_shadow_prev_sample_time = sample_time;
+		_shadow_prev_los_body = los_now;
+	}
+
+	bool calculate_shadow_los_prediction(const uint64_t now)
+	{
+		_shadow_prediction_valid = false;
+		_shadow_prediction_age_us = 0;
+		_shadow_prediction_angle_deg = 0.f;
+		_shadow_los_pred_body = Vector3f{0.f, 0.f, -1.f};
+		_shadow_los_dot_pred_body.zero();
+
+		if (SIMULATION_MODE || !_shadow_los_rate_valid || !_los.target_valid) {
+			return false;
+		}
+
+		const uint64_t sample_time = los_measurement_time(now);
+		if (sample_time == 0 || now < sample_time || now - sample_time > LOS_PREDICT_MAX_US) {
+			return false;
+		}
+
+		const float miss_az = LOS_INPUT_HAS_MISS_ANGLE ? _los.los_azimuth : _los_miss_az_est;
+		const float miss_el = LOS_INPUT_HAS_MISS_ANGLE ? _los.los_elevation : _los_miss_el_est;
+		const Vector3f los_g = calculate_los_body(_los.gimbal_roll, _los.gimbal_pitch, miss_az, miss_el);
+		Vector3f los_sample = guidance_to_px4_body(los_g);
+		const float n = los_sample.norm();
+		if (!PX4_ISFINITE(n) || n <= FLT_EPSILON) { return false; }
+		los_sample /= n;
+
+		Vector3f rate_sample = _shadow_los_dot_filt_body;
+		rate_sample -= los_sample * rate_sample.dot(los_sample);
+		const Vector3f omega_los_sample = los_sample.cross(rate_sample);
+
+		Vector3f los_fixed_now{0.f, 0.f, 0.f};
+		Vector3f omega_los_now{0.f, 0.f, 0.f};
+		if (!propagate_inertial_vector_body_to_now(sample_time, now, los_sample, los_fixed_now)
+		    || !propagate_inertial_vector_body_to_now(sample_time, now, omega_los_sample, omega_los_now)) {
+			return false;
+		}
+
+		const float fixed_norm = los_fixed_now.norm();
+		if (!PX4_ISFINITE(fixed_norm) || fixed_norm <= FLT_EPSILON) { return false; }
+		los_fixed_now /= fixed_norm;
+
+		const uint64_t age_us = now - sample_time;
+		const uint64_t extra_lead_us = calculate_control_extra_lead_us(_shadow_los_dot_filt_body.norm());
+		const float dt_predict = (float)(age_us + extra_lead_us) * 1e-6f;
+		Vector3f pred = rotate_vector_rodrigues(los_fixed_now, omega_los_now * dt_predict);
+		const float pred_norm = pred.norm();
+		if (!PX4_ISFINITE(pred_norm) || pred_norm <= FLT_EPSILON) { return false; }
+		pred /= pred_norm;
+
+		Vector3f pred_rate = omega_los_now.cross(pred);
+		pred_rate -= pred * pred_rate.dot(pred);
+		if (!PX4_ISFINITE(pred_rate(0)) || !PX4_ISFINITE(pred_rate(1)) || !PX4_ISFINITE(pred_rate(2))) {
+			return false;
+		}
+
+		_shadow_los_pred_body = pred;
+		_shadow_los_dot_pred_body = pred_rate;
+		_shadow_prediction_age_us = age_us;
+		const float c = math::constrain(los_fixed_now.dot(pred), -1.f, 1.f);
+		_shadow_prediction_angle_deg = acosf(c) * 180.f / M_PI_F;
+		_shadow_prediction_valid = true;
+		return true;
+	}
+
+	float vector_angle_deg(const Vector3f &a, const Vector3f &b) const
+	{
+		const float na = a.norm();
+		const float nb = b.norm();
+		if (!PX4_ISFINITE(na) || !PX4_ISFINITE(nb) || na <= FLT_EPSILON || nb <= FLT_EPSILON) {
+			return 0.f;
+		}
+		return acosf(math::constrain(a.dot(b) / (na * nb), -1.f, 1.f)) * 180.f / M_PI_F;
+	}
+
+	uint64_t calculate_control_extra_lead_us(const float los_rate_mag) const
+	{
+		const float r = PX4_ISFINITE(los_rate_mag) ? fmaxf(los_rate_mag, 0.f) : 0.f;
+		float lead_us = (float)LOS_CONTROL_EXTRA_LEAD_MIN_US;
+
+		if (r <= LOS_CONTROL_LEAD_RATE_P1) {
+			lead_us = (float)LOS_CONTROL_EXTRA_LEAD_MIN_US;
+		} else if (r <= LOS_CONTROL_LEAD_RATE_P2) {
+			const float u = (r - LOS_CONTROL_LEAD_RATE_P1)
+				/ fmaxf(LOS_CONTROL_LEAD_RATE_P2 - LOS_CONTROL_LEAD_RATE_P1, 0.001f);
+			lead_us = lerp((float)LOS_CONTROL_EXTRA_LEAD_MIN_US, (float)LOS_CONTROL_EXTRA_LEAD_MID_US, smoothstep01(u));
+		} else if (r <= LOS_CONTROL_LEAD_RATE_P3) {
+			const float u = (r - LOS_CONTROL_LEAD_RATE_P2)
+				/ fmaxf(LOS_CONTROL_LEAD_RATE_P3 - LOS_CONTROL_LEAD_RATE_P2, 0.001f);
+			lead_us = lerp((float)LOS_CONTROL_EXTRA_LEAD_MID_US, (float)LOS_CONTROL_EXTRA_LEAD_MAX_US, smoothstep01(u));
+		} else {
+			lead_us = (float)LOS_CONTROL_EXTRA_LEAD_MAX_US;
+		}
+
+		const float att_err = attitude_error_angle_deg();
+		if (PX4_ISFINITE(att_err) && att_err > LOS_CONTROL_LEAD_ATT_ERR_START_DEG) {
+			const float u = math::constrain(
+				(att_err - LOS_CONTROL_LEAD_ATT_ERR_START_DEG)
+				/ fmaxf(LOS_CONTROL_LEAD_ATT_ERR_FULL_DEG - LOS_CONTROL_LEAD_ATT_ERR_START_DEG, 1.f),
+				0.f, 1.f);
+			lead_us += (float)LOS_CONTROL_LEAD_ATT_BOOST_MAX_US * smoothstep01(u);
+		}
+
+		return (uint64_t)math::constrain(lead_us,
+			(float)LOS_CONTROL_EXTRA_LEAD_MIN_US,
+			(float)LOS_CONTROL_EXTRA_LEAD_MAX_US);
+	}
+
+	float calculate_adaptive_attitude_slew_deg_s(const float los_rate_mag) const
+	{
+		const float r = PX4_ISFINITE(los_rate_mag) ? fmaxf(los_rate_mag, 0.f) : 0.f;
+		if (r <= GUIDANCE_SLEW_LOS_RATE_P1) {
+			return GUIDANCE_ATTITUDE_SLEW_DEG_S;
+		}
+		if (r <= GUIDANCE_SLEW_LOS_RATE_P2) {
+			const float u = (r - GUIDANCE_SLEW_LOS_RATE_P1)
+				/ fmaxf(GUIDANCE_SLEW_LOS_RATE_P2 - GUIDANCE_SLEW_LOS_RATE_P1, 0.001f);
+			return lerp(GUIDANCE_ATTITUDE_SLEW_DEG_S, GUIDANCE_ATTITUDE_SLEW_MID_DEG_S, smoothstep01(u));
+		}
+		if (r <= GUIDANCE_SLEW_LOS_RATE_P3) {
+			const float u = (r - GUIDANCE_SLEW_LOS_RATE_P2)
+				/ fmaxf(GUIDANCE_SLEW_LOS_RATE_P3 - GUIDANCE_SLEW_LOS_RATE_P2, 0.001f);
+			return lerp(GUIDANCE_ATTITUDE_SLEW_MID_DEG_S, GUIDANCE_ATTITUDE_SLEW_HIGH_DEG_S, smoothstep01(u));
+		}
+		return GUIDANCE_ATTITUDE_SLEW_HIGH_DEG_S;
+	}
+
+	// V21.10: 构造“当前时刻”的LOS与惯性LOS方向导数。
+	// 真机：capture时刻LOS + capture时刻惯性LOS rate -> 先补偿capture->now期间Body自身旋转，
+	// 再用常惯性LOS角速度模型在球面上外推；SITL保持原当前时刻语义，不额外预测。
+	bool calculate_control_los_body(const uint64_t now, Vector3f &los_body_control,
+					Vector3f &los_dot_control_body, bool &prediction_used)
+	{
+		prediction_used = false;
+		_los_prediction_valid = false;
+		_los_prediction_age_us = 0;
+		_los_prediction_angle_deg = 0.f;
+
+		if (!_los.target_valid || !PX4_ISFINITE(_los.gimbal_roll) || !PX4_ISFINITE(_los.gimbal_pitch)
+		    || !PX4_ISFINITE(_los.los_azimuth) || !PX4_ISFINITE(_los.los_elevation)) {
+			return false;
+		}
+
+		const float miss_az = LOS_INPUT_HAS_MISS_ANGLE ? _los.los_azimuth : _los_miss_az_est;
+		const float miss_el = LOS_INPUT_HAS_MISS_ANGLE ? _los.los_elevation : _los_miss_el_est;
+		const Vector3f los_guidance_sample = calculate_los_body(_los.gimbal_roll, _los.gimbal_pitch, miss_az, miss_el);
+		Vector3f los_body_sample = guidance_to_px4_body(los_guidance_sample);
+		const float los_sample_norm = los_body_sample.norm();
+
+		if (!PX4_ISFINITE(los_sample_norm) || los_sample_norm <= FLT_EPSILON) {
+			return false;
+		}
+		los_body_sample /= los_sample_norm;
+
+		// SITL保持原来的时间语义；truth控制时truth rate本身就是控制输入。
+		if (SIMULATION_MODE) {
+			los_body_control = los_body_sample;
+			if (SIM_USE_TRUTH_LOS_CONTROL && truth_los_fresh(now)) {
+				los_dot_control_body = _truth_los_dot_body;
+			} else if (_inertial_los_rate_valid) {
+				los_dot_control_body = _los_dot_inertial_body;
+			} else {
+				los_dot_control_body.zero();
+			}
+			_los_control_body = los_body_control;
+			_los_dot_control_body = los_dot_control_body;
+			_los_prediction_valid = true;
+			return true;
+		}
+
+		// 真机正式控制必须建立capture时刻惯性LOS rate；预测失败时不混用100ms历史Body LOS作为“当前LOS”。
+		if (!_inertial_los_rate_valid) {
+			return false;
+		}
+
+		const uint64_t sample_time = los_measurement_time(now);
+		if (sample_time == 0 || now < sample_time) {
+			return false;
+		}
+
+		const uint64_t age_us = now - sample_time;
+		if (age_us > LOS_PREDICT_MAX_US) {
+			return false;
+		}
+
+		Vector3f los_dot_sample = _los_dot_inertial_body;
+		los_dot_sample -= los_body_sample * los_dot_sample.dot(los_body_sample);
+		if (!PX4_ISFINITE(los_dot_sample(0)) || !PX4_ISFINITE(los_dot_sample(1)) || !PX4_ISFINITE(los_dot_sample(2))) {
+			return false;
+		}
+
+		// 最小LOS惯性角速度：omega_LOS = L x Ldot，使 omega_LOS x L = Ldot。
+		const Vector3f omega_los_sample = los_body_sample.cross(los_dot_sample);
+
+		Vector3f los_fixed_now{0.f, 0.f, 0.f};
+		Vector3f omega_los_now{0.f, 0.f, 0.f};
+		if (!propagate_inertial_vector_body_to_now(sample_time, now, los_body_sample, los_fixed_now)
+		    || !propagate_inertial_vector_body_to_now(sample_time, now, omega_los_sample, omega_los_now)) {
+			return false;
+		}
+
+		const float fixed_norm = los_fixed_now.norm();
+		if (!PX4_ISFINITE(fixed_norm) || fixed_norm <= FLT_EPSILON) {
+			return false;
+		}
+		los_fixed_now /= fixed_norm;
+
+		const uint64_t extra_lead_us = calculate_control_extra_lead_us(los_dot_sample.norm());
+		const uint64_t total_predict_us = age_us + extra_lead_us;
+		if (total_predict_us > LOS_PREDICT_TOTAL_MAX_US) {
+			return false;
+		}
+		_last_control_extra_lead_us = extra_lead_us;
+		const float dt_predict = (float)total_predict_us * 1e-6f;
+		los_body_control = rotate_vector_rodrigues(los_fixed_now, omega_los_now * dt_predict);
+		const float pred_norm = los_body_control.norm();
+		if (!PX4_ISFINITE(pred_norm) || pred_norm <= FLT_EPSILON) {
+			return false;
+		}
+		los_body_control /= pred_norm;
+
+		los_dot_control_body = omega_los_now.cross(los_body_control);
+		los_dot_control_body -= los_body_control * los_dot_control_body.dot(los_body_control);
+		if (!PX4_ISFINITE(los_dot_control_body(0)) || !PX4_ISFINITE(los_dot_control_body(1))
+		    || !PX4_ISFINITE(los_dot_control_body(2))) {
+			return false;
+		}
+
+		const float c = math::constrain(los_fixed_now.dot(los_body_control), -1.f, 1.f);
+		_los_prediction_angle_deg = acosf(c) * 180.f / M_PI_F;
+		_los_prediction_age_us = age_us;
+		_los_prediction_valid = true;
+		prediction_used = age_us > 0;
+		_los_control_body = los_body_control;
+		_los_dot_control_body = los_dot_control_body;
+		_diag_los_body = los_body_control; // 正式控制诊断显示current-time LOS，而不是100ms历史LOS。
+
+		// V21.12 diagnostic-only shadow prediction and A/B disagreement metrics.
+		calculate_shadow_los_prediction(now);
+		_shadow_formal_rate_angle_deg = (_shadow_los_rate_valid && _inertial_los_rate_valid)
+			? vector_angle_deg(_los_dot_inertial_body, _shadow_los_dot_filt_body) : 0.f;
+		_shadow_formal_pred_angle_deg = (_shadow_prediction_valid && _los_prediction_valid)
+			? vector_angle_deg(_los_control_body, _shadow_los_pred_body) : 0.f;
+		return true;
+	}
+
+
+	// ============================================================
+	// V22.02 LOS-rate 4Hz notch
+	// RBJ biquad notch, component-wise on the formal LOS-rate vector.
+	// Low-frequency/DC gain is unity; initialization uses steady-state values to avoid startup impulse.
+	// ============================================================
+	void reset_los_rate_notch()
+	{
+		_los_rate_notch_initialized = false;
+		_los_rate_notch_x1.zero();
+		_los_rate_notch_x2.zero();
+		_los_rate_notch_y1.zero();
+		_los_rate_notch_y2.zero();
+	}
+
+	Vector3f apply_los_rate_notch(const Vector3f &input)
+	{
+		if (!LOS_RATE_NOTCH_ENABLED) { return input; }
+
+		const float w0 = 2.f * M_PI_F * LOS_RATE_NOTCH_FREQ_HZ / LOS_RATE_NOTCH_FS_HZ;
+		const float c = cosf(w0);
+		const float alpha = sinf(w0) / (2.f * LOS_RATE_NOTCH_Q);
+		const float a0 = 1.f + alpha;
+
+		const float b0 = 1.f / a0;
+		const float b1 = -2.f * c / a0;
+		const float b2 = 1.f / a0;
+		const float a1 = -2.f * c / a0;
+		const float a2 = (1.f - alpha) / a0;
+
+		if (!_los_rate_notch_initialized) {
+			_los_rate_notch_x1 = input;
+			_los_rate_notch_x2 = input;
+			_los_rate_notch_y1 = input;
+			_los_rate_notch_y2 = input;
+			_los_rate_notch_initialized = true;
+			return input;
+		}
+
+		const Vector3f output = input * b0
+			+ _los_rate_notch_x1 * b1
+			+ _los_rate_notch_x2 * b2
+			- _los_rate_notch_y1 * a1
+			- _los_rate_notch_y2 * a2;
+
+		_los_rate_notch_x2 = _los_rate_notch_x1;
+		_los_rate_notch_x1 = input;
+		_los_rate_notch_y2 = _los_rate_notch_y1;
+		_los_rate_notch_y1 = output;
+
+		return output;
+	}
+
+	// ============================================================
+	// V22.04 adaptive BPN acceleration jerk limiter in NED
+	//
+	// 1) LOS-rate越大，说明终端几何变化越快，允许更高jerk；
+	// 2) raw与当前shaped BPN方向差越大，额外提高jerk以快速消除相位滞后；
+	// 3) 仍限制3-D acceleration delta的模，因此不会单轴突然无界跳变。
+	// ============================================================
+	void reset_bpn_jerk_limiter()
+	{
+		_bpn_accel_ned_jerk_limited.zero();
+		_bpn_jerk_initialized = false;
+		_last_bpn_jerk_update_time = 0;
+		_last_bpn_jerk_limit = BPN_JERK_LOW;
+		_last_bpn_jerk_dir_error_deg = 0.f;
+	}
+
+	float calculate_adaptive_bpn_jerk_limit(const Vector3f &raw_bpn_ned) const
+	{
+		const float los_rate = PX4_ISFINITE(_last_los_rate_mag) ? fmaxf(_last_los_rate_mag, 0.f) : 0.f;
+
+		float jerk = BPN_JERK_LOW;
+
+		if (los_rate <= BPN_JERK_LOS_RATE_P1) {
+			jerk = BPN_JERK_LOW;
+
+		} else if (los_rate <= BPN_JERK_LOS_RATE_P2) {
+			const float t = (los_rate - BPN_JERK_LOS_RATE_P1)
+				/ fmaxf(BPN_JERK_LOS_RATE_P2 - BPN_JERK_LOS_RATE_P1, 0.001f);
+			jerk = lerp(BPN_JERK_LOW, BPN_JERK_MID, math::constrain(t, 0.f, 1.f));
+
+		} else if (los_rate <= BPN_JERK_LOS_RATE_P3) {
+			const float t = (los_rate - BPN_JERK_LOS_RATE_P2)
+				/ fmaxf(BPN_JERK_LOS_RATE_P3 - BPN_JERK_LOS_RATE_P2, 0.001f);
+			jerk = lerp(BPN_JERK_MID, BPN_JERK_HIGH, math::constrain(t, 0.f, 1.f));
+
+		} else {
+			jerk = BPN_JERK_HIGH;
+		}
+
+		// Severe raw-vs-shaped direction mismatch means the limiter itself is becoming the dominant phase lag.
+		// Boost only when both vectors have meaningful magnitude; otherwise the direction angle is numerically meaningless.
+		const float raw_norm = raw_bpn_ned.norm();
+		const float shaped_norm = _bpn_accel_ned_jerk_limited.norm();
+
+		if (PX4_ISFINITE(raw_norm) && PX4_ISFINITE(shaped_norm)
+		    && raw_norm > 0.25f && shaped_norm > 0.25f) {
+			const float c = math::constrain(
+					raw_bpn_ned.dot(_bpn_accel_ned_jerk_limited) / (raw_norm * shaped_norm),
+					-1.f, 1.f);
+			const float dir_err_deg = acosf(c) * 180.f / M_PI_F;
+
+			if (PX4_ISFINITE(dir_err_deg) && dir_err_deg > BPN_JERK_DIR_BOOST_START_DEG) {
+				const float u = math::constrain(
+						(dir_err_deg - BPN_JERK_DIR_BOOST_START_DEG)
+						/ fmaxf(BPN_JERK_DIR_BOOST_FULL_DEG - BPN_JERK_DIR_BOOST_START_DEG, 1.f),
+						0.f, 1.f);
+				const float boost = lerp(1.f, BPN_JERK_DIR_BOOST_MAX, u);
+				jerk *= boost;
+			}
+		}
+
+		return math::constrain(jerk, BPN_JERK_LOW, BPN_JERK_ABS_MAX);
+	}
+
+	Vector3f limit_bpn_accel_jerk_ned(const Vector3f &raw_bpn_ned, const uint64_t now)
+	{
+		if (!_bpn_jerk_initialized) {
+			_bpn_accel_ned_jerk_limited = raw_bpn_ned;
+			_bpn_jerk_initialized = true;
+			_last_bpn_jerk_update_time = now;
+			_last_bpn_jerk_limit = BPN_JERK_LOW;
+			_last_bpn_jerk_dir_error_deg = 0.f;
+			return raw_bpn_ned;
+		}
+
+		float dt = LOOP_INTERVAL_US * 1e-6f;
+		if (_last_bpn_jerk_update_time > 0 && now > _last_bpn_jerk_update_time) {
+			dt = (float)(now - _last_bpn_jerk_update_time) * 1e-6f;
+			dt = math::constrain(dt, 0.001f, 0.10f);
+		}
+		_last_bpn_jerk_update_time = now;
+
+		const float raw_norm = raw_bpn_ned.norm();
+		const float shaped_norm = _bpn_accel_ned_jerk_limited.norm();
+		_last_bpn_jerk_dir_error_deg = 0.f;
+
+		if (PX4_ISFINITE(raw_norm) && PX4_ISFINITE(shaped_norm)
+		    && raw_norm > 0.25f && shaped_norm > 0.25f) {
+			const float c = math::constrain(
+					raw_bpn_ned.dot(_bpn_accel_ned_jerk_limited) / (raw_norm * shaped_norm),
+					-1.f, 1.f);
+			_last_bpn_jerk_dir_error_deg = acosf(c) * 180.f / M_PI_F;
+		}
+
+		_last_bpn_jerk_limit = calculate_adaptive_bpn_jerk_limit(raw_bpn_ned);
+
+		Vector3f delta = raw_bpn_ned - _bpn_accel_ned_jerk_limited;
+		const float delta_norm = delta.norm();
+		const float max_delta = _last_bpn_jerk_limit * dt;
+
+		if (PX4_ISFINITE(delta_norm) && delta_norm > max_delta && delta_norm > FLT_EPSILON) {
+			delta *= max_delta / delta_norm;
+		}
+
+		_bpn_accel_ned_jerk_limited += delta;
+		return _bpn_accel_ned_jerk_limited;
+	}
+
+
 	Vector3f calculate_bpn_body(const Vector3f &los_body, const Vector3f &los_dot_body,
 				    const float vc_used) const
 	{
@@ -3086,16 +4904,20 @@ private:
 		return accel_body;
 	}
 
-	bool calculate_los_ned(Vector3f &los_ned) const
+	bool calculate_los_ned(Vector3f &los_ned)
 	{
-		// calculate_los_body()保留历史名，但输出是Guidance/光轴坐标；必须先置换到PX4标准FRD Body，再用vehicle_attitude旋转到NED。
-		if (!attitude_valid() || !_los.target_valid || !PX4_ISFINITE(_los.gimbal_roll) || !PX4_ISFINITE(_los.gimbal_pitch)
-		    || !PX4_ISFINITE(_los.los_azimuth) || !PX4_ISFINITE(_los.los_elevation)) { return false; }
-		const Vector3f los_guidance = calculate_los_body(_los.gimbal_roll, _los.gimbal_pitch, _los_miss_az_est, _los_miss_el_est);
-		const Vector3f los_body = guidance_to_px4_body(los_guidance);
-		const float body_norm = los_body.norm();
-		if (!PX4_ISFINITE(body_norm) || body_norm <= FLT_EPSILON) { return false; }
-		los_ned = Dcmf{current_attitude_q()} * los_body;
+		// V21.10: 正式真机使用预测到当前时刻的PX4 Body LOS，再用当前vehicle_attitude旋到NED。
+		// 这样Vc投影、CLEARANCE和BPN共享同一current-time LOS时间基准。
+		if (!attitude_valid()) { return false; }
+
+		Vector3f los_body_control{0.f, 0.f, 0.f};
+		Vector3f los_dot_control{0.f, 0.f, 0.f};
+		bool prediction_used = false;
+		if (!calculate_control_los_body(hrt_absolute_time(), los_body_control, los_dot_control, prediction_used)) {
+			return false;
+		}
+
+		los_ned = Dcmf{current_attitude_q()} * los_body_control;
 		const float norm = los_ned.norm();
 		if (!PX4_ISFINITE(norm) || norm <= FLT_EPSILON) { return false; }
 		los_ned /= norm;
@@ -3129,6 +4951,15 @@ private:
 			return lerp(GUIDANCE_SPEED_MID_1, GUIDANCE_SPEED_MID_2, t);
 		}
 
+		// V21.3：原逻辑在0.35rad/s上方直接13->6m/s，导致目标速度阶跃。
+		// 现在保留原端点数值，只增加0.35~0.60rad/s连续过渡。
+		if (los_rate_mag <= LOS_RATE_SPEED_POINT_4) {
+			const float t = (los_rate_mag - LOS_RATE_SPEED_POINT_3)
+					/ (LOS_RATE_SPEED_POINT_4 - LOS_RATE_SPEED_POINT_3);
+
+			return lerp(GUIDANCE_SPEED_MID_2, GUIDANCE_SPEED_MIN, t);
+		}
+
 		return GUIDANCE_SPEED_MIN;
 	}
 
@@ -3153,18 +4984,13 @@ private:
 		Vector3f brake{0.f, 0.f, 0.f};
 		brake_mag = 0.f;
 
-		if (!velocity_valid()) { return brake; }
-
-		const Vector3f velocity_ned{
-			_local_position.vx,
-			_local_position.vy,
-			_local_position.vz
-		};
+		Vector3f velocity_ned;
+		if (!get_guidance_velocity_ned(velocity_ned)) { return brake; }
 
 		const float speed = velocity_ned.norm();
 		const float speed_xy = sqrtf(
-				       _local_position.vx * _local_position.vx
-				       + _local_position.vy * _local_position.vy
+				       velocity_ned(0) * velocity_ned(0)
+				       + velocity_ned(1) * velocity_ned(1)
 			       );
 
 		if (!PX4_ISFINITE(speed) || speed < 0.1f) { return brake; }
@@ -3182,7 +5008,11 @@ private:
 
 		float hard_brake = 0.f;
 
-		if (speed > HARD_SPEED_BRAKE_START) {
+		// V21.8：26m/s开始渐进硬制动；达到/超过28m/s名义硬上限时直接打满硬制动。
+		if (speed >= GUIDANCE_SPEED_HARD_LIMIT) {
+			hard_brake = HARD_SPEED_BRAKE_ACCEL_MAX;
+
+		} else if (speed > HARD_SPEED_BRAKE_START) {
 			hard_brake = math::constrain(
 					     HARD_SPEED_BRAKE_KP * (speed - HARD_SPEED_BRAKE_START),
 					     0.f,
@@ -3201,8 +5031,10 @@ private:
 		// 把垂向自由度留给BPN和高度保护。
 		if (normal_brake > 0.f && PX4_ISFINITE(speed_xy) && speed_xy > 0.1f) {
 			brake_mag = normal_brake;
-			brake(0) = -normal_brake * _local_position.vx / speed_xy;
-			brake(1) = -normal_brake * _local_position.vy / speed_xy;
+			// V21.14: brake方向必须与当前guidance velocity源一致；
+			// EKF reset保护期间不能一边用IMU速度算speed，一边又用跳变后的EKF vx/vy决定制动方向。
+			brake(0) = -normal_brake * velocity_ned(0) / speed_xy;
+			brake(1) = -normal_brake * velocity_ned(1) / speed_xy;
 			brake(2) = 0.f;
 		}
 
@@ -3210,50 +5042,74 @@ private:
 	}
 
 	// ============================================================
-	// EKF闭合速度
+	// 相对闭合速度 Vc
 	//
-	// 静止目标 / 未知目标速度：
-	// Vc = v_aircraft_NED · LOS_NED
-	// 正：接近目标
-	// 负：远离目标
+	// V22.01 fixed-wing tracking: unknown target velocity is not guessed.
+	// TARGET_VELOCITY_COMPENSATION_ENABLED=false, therefore Vt=[0,0,0] and Vc_est=Va·LOS.
+	// 正：接近目标；负：目标沿LOS方向远离得更快。
 	// ============================================================
 
 	void update_closing_speed(const uint64_t now)
 	{
 		Vector3f los_ned;
-
-		const bool valid = velocity_valid() && calculate_los_ned(los_ned);
-
-		if (!valid) {
-			_vc_valid = false;
-			_vc_used = VC_FALLBACK;
-			_last_vc_update_time = now;
-			return;
-		}
-
-		const Vector3f velocity_ned{
-			_local_position.vx,
-			_local_position.vy,
-			_local_position.vz
-		};
-
-		_vc_raw = velocity_ned.dot(los_ned);
-
-		if (!PX4_ISFINITE(_vc_raw)) {
-			_vc_valid = false;
-			_vc_used = VC_FALLBACK;
-			_last_vc_update_time = now;
-			return;
-		}
+		Vector3f velocity_ned;
 
 		float dt = LOOP_INTERVAL_US * 1e-6f;
-
 		if (_last_vc_update_time > 0 && now > _last_vc_update_time) {
 			dt = (float)(now - _last_vc_update_time) * 1e-6f;
 			dt = math::constrain(dt, 0.001f, 0.10f);
 		}
-
 		_last_vc_update_time = now;
+
+		const bool valid = get_guidance_velocity_ned(velocity_ned)
+				   && calculate_los_ned(los_ned);
+
+		if (!valid) {
+			// V22.01: do not jump vc_used directly to VC_FALLBACK when EKF/IMU source expires.
+			// Preserve the previous filtered value and exponentially blend toward fallback.
+			_vc_valid = false;
+			_vc_aircraft_only = 0.f;
+			_vc_target_projection = 0.f;
+			_vc_relative_raw = VC_FALLBACK;
+			_vc_raw = VC_FALLBACK;
+
+			if (!_vc_filter_initialized || !PX4_ISFINITE(_vc_filtered)) {
+				_vc_filtered = VC_FALLBACK;
+				_vc_filter_initialized = true;
+			} else {
+				const float alpha = dt / (VC_FALLBACK_BLEND_TAU + dt);
+				_vc_filtered += alpha * (VC_FALLBACK - _vc_filtered);
+			}
+
+			_vc_used = math::constrain(fmaxf(_vc_filtered, 0.f), 0.f, VC_MAX);
+			return;
+		}
+
+		// V22.01 fixed-wing UNKNOWN target velocity mode:
+		// L points aircraft -> target; Vt is intentionally not guessed, therefore Vc_est = Va dot L.
+		_vc_aircraft_only = velocity_ned.dot(los_ned);
+
+		Vector3f target_velocity_ned{0.f, 0.f, 0.f};
+		if (!SIMULATION_MODE && TARGET_VELOCITY_COMPENSATION_ENABLED) {
+			target_velocity_ned(2) = -TARGET_CLIMB_SPEED_MPS;
+		}
+
+		_vc_target_projection = target_velocity_ned.dot(los_ned);
+		_vc_relative_raw = _vc_aircraft_only - _vc_target_projection;
+		_vc_raw = _vc_relative_raw;
+
+		if (!PX4_ISFINITE(_vc_raw) || !PX4_ISFINITE(_vc_aircraft_only) || !PX4_ISFINITE(_vc_target_projection)) {
+			_vc_valid = false;
+			const float alpha = dt / (VC_FALLBACK_BLEND_TAU + dt);
+			if (!_vc_filter_initialized || !PX4_ISFINITE(_vc_filtered)) {
+				_vc_filtered = VC_FALLBACK;
+				_vc_filter_initialized = true;
+			} else {
+				_vc_filtered += alpha * (VC_FALLBACK - _vc_filtered);
+			}
+			_vc_used = math::constrain(fmaxf(_vc_filtered, 0.f), 0.f, VC_MAX);
+			return;
+		}
 
 		if (!_vc_filter_initialized) {
 			_vc_filtered = _vc_raw;
@@ -3308,11 +5164,71 @@ private:
 	}
 
 	// ============================================================
+	// V22.02 final-q thrust synchronization with vertical support priority
+	//
+	// 1) projection term: least-squares realization of desired thrust vector along q_cmd thrust axis;
+	// 2) vertical term: minimum collective required to realize requested NED vertical acceleration with q_cmd;
+	// 3) final collective = max(projection, vertical_required), capped by the active flight-state thrust budget.
+	// This avoids both V21.14's "slewed direction + raw magnitude" excess and V22.01's collapse to MIN_THRUST
+	// when q_raw and q_cmd temporarily differ by a large angle.
+	// ============================================================
+	float active_final_thrust_limit() const
+	{
+		if (_state == GuidanceState::LAUNCH_CLEARANCE) {
+			return CLEARANCE_THRUST_LIMIT;
+		}
+
+		if (_state == GuidanceState::TRANSITION) {
+			return _alt_floor_active ? CLEARANCE_THRUST_LIMIT : GUIDANCE_THRUST_LIMIT;
+		}
+
+		if (_state == GuidanceState::BPN) {
+			return _alt_floor_active ? ALT_FLOOR_THRUST_LIMIT : GUIDANCE_THRUST_LIMIT;
+		}
+
+		return MAX_THRUST;
+	}
+
+	float commanded_thrust_norm_from_accel_and_attitude(const Vector3f &accel_sp_ned, const Quatf &q_cmd) const
+	{
+		const Vector3f gravity_ned{0.f, 0.f, GRAVITY};
+		const Vector3f desired_thrust_accel = accel_sp_ned - gravity_ned;
+
+		const Dcmf R_nb{q_cmd};
+		Vector3f thrust_axis_ned = R_nb * Vector3f{0.f, 0.f, -1.f};
+		const float axis_norm = thrust_axis_ned.norm();
+		const float thrust_limit = math::constrain(active_final_thrust_limit(), MIN_THRUST, MAX_THRUST);
+
+		if (!PX4_ISFINITE(axis_norm) || axis_norm < FLT_EPSILON
+		    || !PX4_ISFINITE(desired_thrust_accel(0)) || !PX4_ISFINITE(desired_thrust_accel(1))
+		    || !PX4_ISFINITE(desired_thrust_accel(2))) {
+			return math::constrain(predicted_thrust_norm_from_accel(accel_sp_ned), MIN_THRUST, thrust_limit);
+		}
+
+		thrust_axis_ned /= axis_norm;
+
+		// Least-squares projection along the physically achievable q_cmd thrust axis.
+		const float projection_accel = fmaxf(desired_thrust_accel.dot(thrust_axis_ned), 0.f);
+
+		// Vertical-support requirement. In NED, thrust_axis_ned(2)<0 for upright flight and
+		// a_z = g + thrust_accel * axis_z. Solve for thrust_accel that realizes accel_sp_ned.z.
+		float vertical_required_accel = 0.f;
+		if (thrust_axis_ned(2) < -0.05f) {
+			vertical_required_accel =
+				fmaxf((accel_sp_ned(2) - GRAVITY) / thrust_axis_ned(2), 0.f);
+		}
+
+		const float commanded_accel = fmaxf(projection_accel, vertical_required_accel);
+		const float thrust_norm = HOVER_THRUST * commanded_accel / GRAVITY;
+		return math::constrain(thrust_norm, MIN_THRUST, thrust_limit);
+	}
+
+	// ============================================================
 	// 垂向优先推力预算
 	//
 	// thrust_limit由调用者决定：
-	// CLEARANCE = 0.95
-	// BPN/TRANSITION = 0.75
+	// CLEARANCE = CLEARANCE_THRUST_LIMIT（legacy路径）
+	// BPN/TRANSITION = GUIDANCE_THRUST_LIMIT
 	// ============================================================
 
 	void constrain_net_accel_vertical_priority(Vector3f &accel_sp_ned, const float thrust_limit) const
@@ -3375,7 +5291,7 @@ private:
 					    const float thrust_limit, Vector3f &accel_sp_ned, float &axial_used, float &bpn_scale, float &predicted_thrust) const
 	{
 		const Vector3f gravity_ned{0.f, 0.f, GRAVITY};
-		// 推力预算由调用路径明确传入：正式BPN与零推力TEST候选当前都使用0.75；接口保留参数化，便于后续独立诊断。
+		// 推力预算由调用路径明确传入：正式BPN与零推力TEST候选当前都使用GUIDANCE_THRUST_LIMIT；接口保留参数化，便于后续独立诊断。
 		const float budget = thrust_accel_budget(thrust_limit);
 
 		// 第一级：BPN优先。
@@ -3514,7 +5430,10 @@ private:
 	// ============================================================
 
 	void acceleration_to_attitude(const Vector3f &accel_sp_ned, const float yaw_sp,
-				      Quatf &q_sp, float &thrust_norm) const
+				      Quatf &q_sp, float &thrust_norm,
+				      bool *feasibility_limited = nullptr,
+				      float *raw_tilt_deg = nullptr,
+				      float *cmd_tilt_deg = nullptr) const
 	{
 		const Vector3f gravity_ned{0.f, 0.f, GRAVITY};
 
@@ -3529,10 +5448,38 @@ private:
 
 		body_z.normalize();
 
+		const float raw_tilt = acosf(math::constrain(body_z(2), -1.f, 1.f));
+		bool limited = false;
+
+		// V21.14: positive-thrust multirotor feasibility cone.
+		// body_z is Body +Z expressed in NED. Upright hover is [0,0,+1].
+		// Any requested body_z with tilt > MAX_TILT (including body_z.z<0 inverted solutions)
+		// is projected to the nearest direction on the upright cone while preserving horizontal azimuth.
+		const float min_body_z_z = cosf(GUIDANCE_THRUST_VECTOR_MAX_TILT_RAD);
+		if (body_z(2) < min_body_z_z) {
+			const float xy_norm = sqrtf(body_z(0) * body_z(0) + body_z(1) * body_z(1));
+
+			if (PX4_ISFINITE(xy_norm) && xy_norm > FLT_EPSILON) {
+				const float sin_tilt = sinf(GUIDANCE_THRUST_VECTOR_MAX_TILT_RAD);
+				body_z(0) = body_z(0) * (sin_tilt / xy_norm);
+				body_z(1) = body_z(1) * (sin_tilt / xy_norm);
+				body_z(2) = min_body_z_z;
+			} else {
+				// Pure inverted/ill-conditioned vertical request has no meaningful horizontal azimuth.
+				// Safest feasible projection is upright rather than choosing an arbitrary 75deg direction.
+				body_z = Vector3f{0.f, 0.f, 1.f};
+			}
+			body_z.normalize();
+			limited = true;
+		}
+
+		const float cmd_tilt = acosf(math::constrain(body_z(2), -1.f, 1.f));
+
 		const Vector3f y_C{-sinf(yaw_sp), cosf(yaw_sp), 0.f};
 
 		Vector3f body_x = y_C % body_z;
 
+		// body_z经过可行域约束后始终保持upright hemisphere；保留数值防护。
 		if (body_z(2) < 0.f) {
 			body_x = -body_x;
 		}
@@ -3561,9 +5508,16 @@ private:
 		q_sp = Quatf{R_sp};
 		q_sp.normalize();
 
+		// Magnitude follows the original requested net thrust acceleration; only direction is made feasible.
+		// This prevents q_raw 180deg flips without silently increasing demanded thrust magnitude.
 		thrust_norm = HOVER_THRUST * thrust_accel_mag / GRAVITY;
 		thrust_norm = math::constrain(thrust_norm, MIN_THRUST, MAX_THRUST);
+
+		if (feasibility_limited) { *feasibility_limited = limited; }
+		if (raw_tilt_deg) { *raw_tilt_deg = raw_tilt * 180.f / M_PI_F; }
+		if (cmd_tilt_deg) { *cmd_tilt_deg = cmd_tilt * 180.f / M_PI_F; }
 	}
+
 
 	// ============================================================
 	// 发布
@@ -3646,7 +5600,9 @@ private:
 		// 【V21修改】新增miss_rate_px4记录正式参与IMG计算的PX4中心差分rate。
 		los_msg.miss_rate_px4[0] = _diag_miss_az_rate_px4;
 		los_msg.miss_rate_px4[1] = _diag_miss_el_rate_px4;
-		los_msg.miss_rate_window_ms = (float)(2ULL * MISS_RATE_CENTER_HALF_WINDOW_US) * 1e-3f;
+		los_msg.miss_rate_window_ms = (_diag_miss_rate_mode == 2)
+			? (float)((MISS_RATE_POLYFIT_POINTS - 1U) * MISS_RATE_BACKWARD_STEP_US) * 1e-3f
+			: (float)(2ULL * MISS_RATE_CENTER_HALF_WINDOW_US) * 1e-3f;
 		los_msg.miss_rate_valid = _diag_miss_rate_valid ? 1 : 0;
 
 		for (int i = 0; i < 3; ++i) {
@@ -3673,12 +5629,55 @@ private:
 		_pn_guidance_los_diag_pub.publish(los_msg);
 
 		// ========================================================
+		// V21.12 Observer A/B shadow diagnostics (50 Hz, logging only).
+		// ========================================================
+		pn_guidance_observer_diag_s observer_msg{};
+		observer_msg.timestamp = now;
+		observer_msg.sample_time = _last_los_sample_time;
+		observer_msg.seq = seq;
+		observer_msg.version = 1;
+		observer_msg.sample_age_ms = (float)_last_los_sample_age_us * 1e-3f;
+		observer_msg.shadow_dt_ms = _shadow_dt_s * 1000.f;
+		observer_msg.shadow_residual_angle_deg = _shadow_residual_angle_deg;
+		observer_msg.shadow_filter_alpha = _shadow_filter_alpha;
+
+		const float formal_rate_mag = _los_dot_inertial_body.norm();
+		const float shadow_raw_mag = _shadow_los_dot_raw_body.norm();
+		const float shadow_filt_mag = _shadow_los_dot_filt_body.norm();
+		observer_msg.formal_rate_mag = PX4_ISFINITE(formal_rate_mag) ? formal_rate_mag : 0.f;
+		observer_msg.shadow_rate_raw_mag = PX4_ISFINITE(shadow_raw_mag) ? shadow_raw_mag : 0.f;
+		observer_msg.shadow_rate_filt_mag = PX4_ISFINITE(shadow_filt_mag) ? shadow_filt_mag : 0.f;
+		observer_msg.formal_shadow_rate_angle_deg = _shadow_formal_rate_angle_deg;
+		observer_msg.formal_prediction_age_ms = (float)_los_prediction_age_us * 1e-3f;
+		observer_msg.shadow_prediction_age_ms = (float)_shadow_prediction_age_us * 1e-3f;
+		observer_msg.formal_shadow_pred_angle_deg = _shadow_formal_pred_angle_deg;
+		observer_msg.miss_rate_formal[0] = _diag_miss_az_rate_px4;
+		observer_msg.miss_rate_formal[1] = _diag_miss_el_rate_px4;
+		observer_msg.miss_rate_backward3[0] = _diag_miss_az_rate_backward3;
+		observer_msg.miss_rate_backward3[1] = _diag_miss_el_rate_backward3;
+		observer_msg.miss_rate_mode = _diag_miss_rate_mode;
+
+		for (int i = 0; i < 3; ++i) {
+			observer_msg.formal_rate[i] = _los_dot_inertial_body(i);
+			observer_msg.shadow_rate_raw[i] = _shadow_los_dot_raw_body(i);
+			observer_msg.shadow_rate_filt[i] = _shadow_los_dot_filt_body(i);
+			observer_msg.formal_pred_los[i] = _los_control_body(i);
+			observer_msg.shadow_pred_los[i] = _shadow_los_pred_body(i);
+		}
+		observer_msg.formal_rate_valid = _inertial_los_rate_valid ? 1 : 0;
+		observer_msg.shadow_rate_valid = _shadow_los_rate_valid ? 1 : 0;
+		observer_msg.formal_prediction_valid = _los_prediction_valid ? 1 : 0;
+		observer_msg.shadow_prediction_valid = _shadow_prediction_valid ? 1 : 0;
+		observer_msg.target_valid = _los.target_valid ? 1 : 0;
+		_pn_guidance_observer_diag_pub.publish(observer_msg);
+
+		// ========================================================
 		// 2) Guidance
 		// ========================================================
 		pn_guidance_guidance_diag_s guidance_msg{};
 		guidance_msg.timestamp = now;
 		guidance_msg.seq = seq;
-		guidance_msg.version = 3;
+		guidance_msg.version = 4;
 
 		guidance_msg.vc_raw = _vc_raw;
 		guidance_msg.vc_filtered = _vc_filtered;
@@ -3786,6 +5785,16 @@ private:
 
 	void publish_attitude_setpoint_internal(const Quatf &q_d, const float thrust_norm, const uint64_t now)
 	{
+		// V21.4最终防线：RC拥有姿态控制权或RC_OVERRIDE已锁存时，pn_guidance绝不再写vehicle_attitude_setpoint。
+		// RIG固定台架与DISARMED接口测试保留原行为。
+		if (!SIMULATION_MODE && armed() && _rig_stage.load() == 0u
+		    && (_rc_override_latched || rc_manual_attitude_owner_active(now))) {
+			_diag_control_published = false;
+			_diag_thrust_out = 0.f;
+			_last_thrust_sp = 0.f;
+			return;
+		}
+
 		vehicle_attitude_setpoint_s sp{};
 
 		sp.timestamp = now;
@@ -3822,6 +5831,9 @@ private:
 	void publish_direct_attitude(const Quatf &q_d, const float thrust_norm, const uint64_t now)
 	{
 		_last_raw_q_sp = q_d;
+		_last_thrust_vector_feasibility_limited = false;
+		_last_thrust_vector_raw_tilt_deg = 0.f;
+		_last_thrust_vector_cmd_tilt_deg = 0.f;
 		_slew_active = false;
 		_last_raw_q_step_deg = 0.f;
 		_lead_active = false;
@@ -3842,9 +5854,16 @@ private:
 	{
 		Quatf q_raw;
 		float thrust_norm = 0.f;
+		bool feasibility_limited = false;
+		float raw_tilt_deg = 0.f;
+		float cmd_tilt_deg = 0.f;
 
-		acceleration_to_attitude(accel_sp_ned, _yaw_lock, q_raw, thrust_norm);
+		acceleration_to_attitude(accel_sp_ned, _yaw_lock, q_raw, thrust_norm,
+				       &feasibility_limited, &raw_tilt_deg, &cmd_tilt_deg);
 
+		_last_thrust_vector_feasibility_limited = feasibility_limited;
+		_last_thrust_vector_raw_tilt_deg = raw_tilt_deg;
+		_last_thrust_vector_cmd_tilt_deg = cmd_tilt_deg;
 		_last_raw_q_sp = q_raw;
 
 		float dt = LOOP_INTERVAL_US * 1e-6f;
@@ -3883,6 +5902,32 @@ private:
 			   - CLEARANCE_ATTITUDE_SLEW_DEG_S);
 		}
 
+		// V22.05: after the launch-protection state logic, allow higher slew only when the current LOS-rate justifies it.
+		// The V22.03 gimbal-protection cap below still wins during the first 1.5s.
+		if (_state == GuidanceState::BPN) {
+			_last_adaptive_slew_deg_s = calculate_adaptive_attitude_slew_deg_s(_last_los_rate_mag);
+			attitude_slew_deg_s = fmaxf(attitude_slew_deg_s, _last_adaptive_slew_deg_s);
+		} else {
+			_last_adaptive_slew_deg_s = attitude_slew_deg_s;
+		}
+
+		// V22.03: early post-RELEASE attitude slew cap (80 -> 110deg/s over 1.5s).
+		// This only reduces the normal state-specific slew; it never increases a tighter state limit.
+		if (_guidance_release_time > 0
+		    && (_state == GuidanceState::TRANSITION || _state == GuidanceState::BPN)) {
+			update_gimbal_protect_schedule(now);
+			attitude_slew_deg_s = fminf(attitude_slew_deg_s, _last_gimbal_protect_slew_deg_s);
+		}
+
+		// V22.06: when gimbal load is high, do not let terminal adaptive-slew outrun the two-axis stabilizer.
+		// Safe load leaves the V22.05 110->135deg/s adaptive behaviour unchanged.
+		if (_state == GuidanceState::TRANSITION || _state == GuidanceState::BPN) {
+			attitude_slew_deg_s = fminf(attitude_slew_deg_s, _gimbal_supervisor_slew_cap_deg_s);
+		}
+		if (attitude_reset_guard_active(now)) {
+			attitude_slew_deg_s = fminf(attitude_slew_deg_s, ATT_RESET_GUARD_SLEW_CAP_DEG_S);
+		}
+
 		const float attitude_slew_rad_s =
 		    attitude_slew_deg_s * M_PI_F / 180.f;
 
@@ -3904,30 +5949,55 @@ private:
 
 		_last_raw_q_step_deg = raw_step_rad * 180.f / M_PI_F;
 
-		// 第二级：限制setpoint相对于飞机真实姿态最多领先30deg。
+		// 第二级：限制setpoint相对于飞机真实姿态的领先量。
+		// V21.9.2：CLEARANCE/TRANSITION单独收紧，正式BPN使用GUIDANCE_ATTITUDE_LEAD_MAX_DEG（当前65deg）。
+		float attitude_lead_max_deg = GUIDANCE_ATTITUDE_LEAD_MAX_DEG;
+
+		if (_state == GuidanceState::LAUNCH_CLEARANCE) {
+			attitude_lead_max_deg = CLEARANCE_ATTITUDE_LEAD_MAX_DEG;
+
+		} else if (_state == GuidanceState::TRANSITION) {
+			attitude_lead_max_deg = TRANSITION_ATTITUDE_LEAD_START_DEG
+				+ _transition_phase * (TRANSITION_ATTITUDE_LEAD_END_DEG - TRANSITION_ATTITUDE_LEAD_START_DEG);
+		}
+
+		// V22.06: q_cmd-to-actual lead protection directly limits the rate demand generated by the attitude P loop.
+		// It is the main response to the flight where body rate reached ~110deg/s while the gimbal transiently lagged.
+		if (_state == GuidanceState::BPN) {
+			attitude_lead_max_deg = fminf(attitude_lead_max_deg, _gimbal_supervisor_lead_cap_deg);
+		}
+		if (attitude_reset_guard_active(now)) {
+			attitude_lead_max_deg = fminf(attitude_lead_max_deg, ATT_RESET_GUARD_LEAD_CAP_DEG);
+		}
+
+		const float attitude_lead_max_rad = attitude_lead_max_deg * M_PI_F / 180.f;
 		float lead_angle_rad = 0.f;
 
 		const Quatf q_cmd = slerp_limited(
 					    current_attitude_q(),
 					    q_slew,
-					    GUIDANCE_ATTITUDE_LEAD_MAX_RAD,
+					    attitude_lead_max_rad,
 					    _lead_active,
 					    lead_angle_rad
 				    );
 
 		_last_attitude_lead_deg = lead_angle_rad * 180.f / M_PI_F;
 
+		// V22.02: raw thrust is retained as preview only. Final collective uses q_cmd with vertical-support priority,
+		// preventing the V22.01 projection-only collapse toward MIN_THRUST when q_raw and q_cmd differ greatly.
+		const float thrust_cmd = commanded_thrust_norm_from_accel_and_attitude(accel_sp_ned, q_cmd);
+
 		_diag_accel_cmd_ned = accel_sp_ned;
 		_diag_q_raw = q_raw;
 		_diag_q_slew = q_slew;
 		_diag_q_cmd = q_cmd;
-		_diag_thrust_preview = thrust_norm;
+		_diag_thrust_preview = thrust_norm; // pre-slew/raw acceleration magnitude
 		_diag_slew_limited = _slew_active;
 		_diag_lead_limited = _lead_active;
 		_diag_cage_limited = false;
 		_diag_guidance_valid = true;
 
-		publish_attitude_setpoint_internal(q_cmd, thrust_norm, now);
+		publish_attitude_setpoint_internal(q_cmd, thrust_cmd, now);
 	}
 
 	void publish_guidance_acceleration(const Vector3f &bpn_accel_body, const bool valid, const uint64_t now)
@@ -3951,8 +6021,6 @@ private:
 
 	bool calculate_bpn_target(Vector3f &accel_sp_ned, Vector3f &bpn_accel_body)
 	{
-		// LOS方向：V18 A/B直接使用Python发送的真实camera miss angle；
-		// 原V16 observer仍更新_recon LOS rate，但不参与仿真控制。
 		if (!attitude_valid() || !_los.target_valid
 		    || !PX4_ISFINITE(_los.gimbal_roll) || !PX4_ISFINITE(_los.gimbal_pitch)
 		    || !PX4_ISFINITE(_los.los_azimuth) || !PX4_ISFINITE(_los.los_elevation)
@@ -3960,119 +6028,128 @@ private:
 			return false;
 		}
 
-		const float miss_az =
-			LOS_INPUT_HAS_MISS_ANGLE
-			? _los.los_azimuth
-			: _los_miss_az_est;
-
-		const float miss_el =
-			LOS_INPUT_HAS_MISS_ANGLE
-			? _los.los_elevation
-			: _los_miss_el_est;
-
-		const Vector3f los_guidance =
-			calculate_los_body(
-				_los.gimbal_roll,
-				_los.gimbal_pitch,
-				miss_az,
-				miss_el);
-
-		const float los_guidance_norm = los_guidance.norm();
-
-		if (!PX4_ISFINITE(los_guidance_norm)
-		    || los_guidance_norm <= FLT_EPSILON) {
-			return false;
-		}
-
-		const bool use_truth =
-			SIMULATION_MODE && SIM_USE_TRUTH_LOS_CONTROL;
-
-		const bool truth_ready =
-			use_truth && truth_los_fresh(hrt_absolute_time());
-
+		const uint64_t now = hrt_absolute_time();
+		const bool use_truth = SIMULATION_MODE && SIM_USE_TRUTH_LOS_CONTROL;
+		const bool truth_ready = use_truth && truth_los_fresh(now);
 		if (use_truth && !truth_ready) {
 			return false;
 		}
-
 		if (!use_truth && !_inertial_los_rate_valid) {
 			return false;
 		}
 
-		// ------------------------------------------------------------
-		// 同时保留TRUE和RECON两条链：
-		// TRUE : Gazebo truth -> DEBUG_VECT("LOS_TRUE") -> BPN控制
-		// RECON: TARGET_LOS -> V16 observer -> shadow only
-		// ------------------------------------------------------------
-		Vector3f los_dot_control_body =
-			use_truth
-			? _truth_los_dot_body
-			: _los_dot_inertial_body;
+		Vector3f los_body_control{0.f, 0.f, 0.f};
+		Vector3f los_dot_control_body{0.f, 0.f, 0.f};
+		bool prediction_used = false;
 
-		const Vector3f los_dot_guidance =
-			px4_body_to_guidance(los_dot_control_body);
+		if (use_truth) {
+			// SITL保持原语义：几何LOS来自当前vehicle_target_los，LOS rate直接使用truth。
+			const float miss_az = LOS_INPUT_HAS_MISS_ANGLE ? _los.los_azimuth : _los_miss_az_est;
+			const float miss_el = LOS_INPUT_HAS_MISS_ANGLE ? _los.los_elevation : _los_miss_el_est;
+			const Vector3f los_g = calculate_los_body(_los.gimbal_roll, _los.gimbal_pitch, miss_az, miss_el);
+			los_body_control = guidance_to_px4_body(los_g);
+			const float n = los_body_control.norm();
+			if (!PX4_ISFINITE(n) || n <= FLT_EPSILON) { return false; }
+			los_body_control /= n;
+			los_dot_control_body = _truth_los_dot_body;
+		} else {
+			// 真机：BPN只使用预测到当前时刻的LOS/Ldot；预测链失败则由上层重捕获/target-loss保护接管。
+			if (!calculate_control_los_body(now, los_body_control, los_dot_control_body, prediction_used)) {
+				return false;
+			}
+		}
 
-		_last_truth_los_rate_mag =
-			truth_ready
-			? _truth_los_dot_body.norm()
-			: 0.f;
+		const Vector3f los_guidance = px4_body_to_guidance(los_body_control);
+		const Vector3f los_dot_guidance = px4_body_to_guidance(los_dot_control_body);
+		const float los_guidance_norm = los_guidance.norm();
+		if (!PX4_ISFINITE(los_guidance_norm) || los_guidance_norm <= FLT_EPSILON) {
+			return false;
+		}
 
-		_last_recon_los_rate_mag =
-			_inertial_los_rate_valid
-			? _los_dot_inertial_body.norm()
-			: 0.f;
-
+		_last_truth_los_rate_mag = truth_ready ? _truth_los_dot_body.norm() : 0.f;
+		_last_recon_los_rate_mag = _inertial_los_rate_valid ? _los_dot_inertial_body.norm() : 0.f;
 		_last_truth_recon_error_mag =
 			(truth_ready && _inertial_los_rate_valid)
 			? (_los_dot_inertial_body - _truth_los_dot_body).norm()
 			: 0.f;
 
-		// 分别算两套原始BPN，便于日志逐帧比较。
+		// A/B原始BPN诊断：SITL保留truth/recon比较；真机RECON使用实际current-time预测链。
 		_last_bpn_truth_body_raw.zero();
 		_last_bpn_recon_body_raw.zero();
 
 		if (truth_ready) {
-			const Vector3f truth_guidance =
-				px4_body_to_guidance(_truth_los_dot_body);
-
-			const Vector3f bpn_truth_guidance =
-				calculate_bpn_body(
-					los_guidance,
-					truth_guidance,
-					_vc_used);
-
-			_last_bpn_truth_body_raw =
-				guidance_to_px4_body(bpn_truth_guidance);
+			const Vector3f truth_guidance = px4_body_to_guidance(_truth_los_dot_body);
+			const Vector3f bpn_truth_guidance = calculate_bpn_body(los_guidance, truth_guidance, _vc_used);
+			_last_bpn_truth_body_raw = guidance_to_px4_body(bpn_truth_guidance);
 		}
 
 		if (_inertial_los_rate_valid) {
-			const Vector3f recon_guidance =
-				px4_body_to_guidance(_los_dot_inertial_body);
-
-			const Vector3f bpn_recon_guidance =
-				calculate_bpn_body(
-					los_guidance,
-					recon_guidance,
-					_vc_used);
-
-			_last_bpn_recon_body_raw =
-				guidance_to_px4_body(bpn_recon_guidance);
+			Vector3f recon_los_body = los_body_control;
+			Vector3f recon_dot_body = _los_dot_inertial_body;
+			if (!use_truth) {
+				recon_dot_body = los_dot_control_body;
+			}
+			const Vector3f recon_los_guidance = px4_body_to_guidance(recon_los_body);
+			const Vector3f recon_dot_guidance = px4_body_to_guidance(recon_dot_body);
+			const Vector3f bpn_recon_guidance = calculate_bpn_body(recon_los_guidance, recon_dot_guidance, _vc_used);
+			_last_bpn_recon_body_raw = guidance_to_px4_body(bpn_recon_guidance);
 		}
 
 		_last_los_rate_mag = los_dot_guidance.norm();
 		_last_speed_target =
 			calculate_guidance_speed_target(_last_los_rate_mag);
 
-		const float ekf_speed = get_ekf_speed();
+		const float guidance_speed = get_guidance_speed();
 
-		_last_speed_axial_scale =
-			PX4_ISFINITE(ekf_speed)
-			? calculate_axial_speed_scale(
-				ekf_speed,
-				_last_speed_target)
-			: 1.f;
+		// V22.03: update the post-RELEASE gimbal-protection schedule once per BPN target calculation.
+		update_gimbal_protect_schedule(now);
 
-		_last_axial_limit_cmd =
-			AXIAL_ACCEL_MAX * _last_speed_axial_scale;
+		if (PX4_ISFINITE(guidance_speed)) {
+			_last_speed_axial_scale =
+				calculate_axial_speed_scale(
+					guidance_speed,
+					_last_speed_target);
+
+			const float desired_axial_limit = AXIAL_ACCEL_MAX * _last_speed_axial_scale;
+			// If velocity validity has just recovered, blend back instead of stepping 3->5m/s^2.
+			if (!_last_guidance_speed_valid && PX4_ISFINITE(_last_axial_limit_cmd) && _last_axial_limit_cmd > 0.f) {
+				const float dt_ax = LOOP_INTERVAL_US * 1e-6f;
+				const float alpha_ax = dt_ax / (AXIAL_DEGRADED_BLEND_TAU + dt_ax);
+				_last_axial_limit_cmd += alpha_ax * (desired_axial_limit - _last_axial_limit_cmd);
+			} else {
+				_last_axial_limit_cmd = desired_axial_limit;
+			}
+			_last_guidance_speed_valid = true;
+
+		} else {
+			// V22.01: velocity source unavailable. Keep the conservative 3m/s^2 target,
+			// but blend toward it so EKF/IMU expiry does not create a collective-thrust step.
+			const float degraded_scale =
+				math::constrain(AXIAL_ACCEL_DEGRADED_NO_VEL / fmaxf(AXIAL_ACCEL_MAX, 0.1f), 0.f, 1.f);
+			_last_speed_axial_scale = degraded_scale;
+
+			if (!PX4_ISFINITE(_last_axial_limit_cmd) || _last_axial_limit_cmd <= 0.f) {
+				_last_axial_limit_cmd = AXIAL_ACCEL_DEGRADED_NO_VEL;
+			} else {
+				const float dt_ax = LOOP_INTERVAL_US * 1e-6f;
+				const float alpha_ax = dt_ax / (AXIAL_DEGRADED_BLEND_TAU + dt_ax);
+				_last_axial_limit_cmd += alpha_ax * (AXIAL_ACCEL_DEGRADED_NO_VEL - _last_axial_limit_cmd);
+			}
+			_last_guidance_speed_valid = false;
+		}
+
+		// V22.03: early post-RELEASE axial cap. This is an upper bound only; speed taper/degraded logic may command less.
+		_last_axial_limit_cmd = fminf(_last_axial_limit_cmd, _last_gimbal_protect_axial_cap);
+
+		// V22.06: gimbal-load protection is transparent in the safe region and progressively lowers only
+		// the forward/axial demand when the gimbal is approaching its high-dynamic envelope.
+		_last_axial_limit_cmd = fminf(_last_axial_limit_cmd, _gimbal_supervisor_axial_cap);
+
+		// EKF attitude/yaw reset guard: keep the airframe calm for a short window while all reference-linked
+		// states settle.  Lateral BPN remains available; the first action is simply to stop accelerating hard.
+		if (attitude_reset_guard_active(now)) {
+			_last_axial_limit_cmd = fminf(_last_axial_limit_cmd, ATT_RESET_GUARD_AXIAL_CAP);
+		}
 
 		// 当前真正用于控制的BPN。
 		const Vector3f bpn_accel_guidance =
@@ -4084,8 +6161,7 @@ private:
 		_last_bpn_norm_raw =
 			bpn_accel_guidance.norm();
 
-		const Vector3f los_body =
-			guidance_to_px4_body(los_guidance);
+		const Vector3f los_body = los_body_control;
 
 		const Vector3f bpn_accel_body_raw =
 			guidance_to_px4_body(
@@ -4106,13 +6182,62 @@ private:
 		const Vector3f bpn_accel_ned_raw =
 			R_nb * bpn_accel_body_raw;
 
+		// V22.03: during the first 1.5s after RELEASE, release lateral authority from 75% to 100%.
+		// Apply this before the existing NED jerk limiter so the limiter state follows the actually permitted command.
+		const Vector3f bpn_accel_ned_release_limited =
+			bpn_accel_ned_raw * _last_gimbal_protect_bpn_scale;
+
+		// V22.02: shape only the lateral BPN vector; axial acceleration and speed-brake remain independent.
+		Vector3f bpn_accel_ned_shaped =
+			limit_bpn_accel_jerk_ned(bpn_accel_ned_release_limited, now);
+
+		// V22.05 weak boresight-centering assist. The gimbal center LOS and target LOS are compared in the
+		// same Guidance frame; only the tangent component is used, and the term is hard-limited to 1.2m/s^2.
+		_last_centering_assist_norm = 0.f;
+		if (_state == GuidanceState::BPN && _last_los_rate_mag >= CENTERING_ASSIST_MIN_LOS_RATE) {
+			const float miss_az = LOS_INPUT_HAS_MISS_ANGLE ? _los.los_azimuth : _los_miss_az_est;
+			const float miss_el = LOS_INPUT_HAS_MISS_ANGLE ? _los.los_elevation : _los_miss_el_est;
+			const float miss_mag_rad = sqrtf(miss_az * miss_az + miss_el * miss_el);
+			const float miss_deg = miss_mag_rad * 180.f / M_PI_F;
+			if (PX4_ISFINITE(miss_deg) && miss_deg > CENTERING_ASSIST_START_DEG) {
+				const Vector3f center_guidance = calculate_los_body(_los.gimbal_roll, _los.gimbal_pitch, 0.f, 0.f);
+				const Vector3f center_body = guidance_to_px4_body(center_guidance);
+				Vector3f center_ned = R_nb * center_body;
+				const float cn = center_ned.norm();
+				if (PX4_ISFINITE(cn) && cn > FLT_EPSILON) {
+					center_ned /= cn;
+					Vector3f tangent = los_ned - center_ned;
+					tangent -= los_ned * tangent.dot(los_ned);
+					const float tn = tangent.norm();
+					if (PX4_ISFINITE(tn) && tn > FLT_EPSILON) {
+						const float u = math::constrain((miss_deg - CENTERING_ASSIST_START_DEG)
+							/ fmaxf(CENTERING_ASSIST_FULL_DEG - CENTERING_ASSIST_START_DEG, 0.1f), 0.f, 1.f);
+						const float mag = fminf(CENTERING_ASSIST_GAIN * miss_mag_rad, CENTERING_ASSIST_MAX)
+							* smoothstep01(u);
+						const Vector3f assist_ned = tangent * (mag / tn);
+						bpn_accel_ned_shaped += assist_ned;
+						_last_centering_assist_norm = mag;
+					}
+				}
+			}
+		}
+
+		// Keep the total lateral command inside the existing BPN envelope even after the weak centering assist.
+		const float shaped_total_norm = bpn_accel_ned_shaped.norm();
+		if (PX4_ISFINITE(shaped_total_norm) && shaped_total_norm > BPN_ACCEL_MAX && shaped_total_norm > FLT_EPSILON) {
+			bpn_accel_ned_shaped *= BPN_ACCEL_MAX / shaped_total_norm;
+		}
+
+		const Vector3f bpn_accel_body_shaped =
+			R_nb.transpose() * bpn_accel_ned_shaped;
+
 		float axial_used = 0.f;
 		float bpn_scale = 1.f;
 		float predicted_thrust = 0.f;
 
 		allocate_guidance_acceleration(
 			los_ned,
-			bpn_accel_ned_raw,
+			bpn_accel_ned_shaped,
 			_last_axial_limit_cmd,
 			GUIDANCE_THRUST_LIMIT,
 			accel_sp_ned,
@@ -4130,10 +6255,11 @@ private:
 		_last_speed_brake = speed_brake_mag;
 
 		bpn_accel_body =
-			bpn_accel_body_raw * bpn_scale;
+			bpn_accel_body_shaped * bpn_scale;
 
 		_last_axial_used = axial_used;
-		_last_bpn_scale = bpn_scale;
+		// Include V22.03 release-authority scheduling in the logged total scale.
+		_last_bpn_scale = bpn_scale * _last_gimbal_protect_bpn_scale;
 		_last_bpn_norm_used = bpn_accel_body.norm();
 		_last_predicted_thrust = predicted_thrust;
 
@@ -4206,6 +6332,8 @@ private:
 
 	void enter_wait_release(const uint64_t now)
 	{
+		reset_bpn_jerk_limiter();
+		reset_gimbal_protect_window();
 		_hold_q = current_attitude_q();
 
 		_state = GuidanceState::WAIT_RELEASE;
@@ -4226,6 +6354,27 @@ private:
 	}
 
 	// ============================================================
+	// V21.9.1: RELEASE真正接受时重新锁定当前Yaw
+	//
+	// WAIT_LOS阶段的yaw_lock可能比实际AUX1 RELEASE早很多；如果期间机体被搬动/转向，
+	// 继续沿用旧yaw_lock会在制导接管后额外产生大幅偏航命令，迫使两轴云台高速反向补偿。
+	// 因此只在AUX1 HIGH完成100ms确认且所有RELEASE guard均通过后刷新一次。
+	// CLEARANCE/TRANSITION/BPN的其余逻辑均保持v21.9不变。
+	// ============================================================
+	void relock_yaw_at_release(const char *source)
+	{
+		const float old_yaw = _yaw_lock;
+		const Eulerf euler_now{current_attitude_q()};
+		_yaw_lock = euler_now.psi();
+		_yaw_locked = true;
+
+		PX4_INFO("%s accepted: YAW RELOCK %.1f -> %.1f deg",
+			 source,
+			 (double)(old_yaw * 180.f / M_PI_F),
+			 (double)(_yaw_lock * 180.f / M_PI_F));
+	}
+
+	// ============================================================
 	// V21.2 正式飞行：RELEASE后直接进入BPN ACTIVE
 	//
 	// 不经过LAUNCH_CLEARANCE和TRANSITION，也不做BPN gain ramp。
@@ -4237,6 +6386,8 @@ private:
 	// ============================================================
 	void enter_bpn_active(const uint64_t now)
 	{
+		reset_bpn_jerk_limiter();
+		start_gimbal_protect_window(now);
 		_hold_q = current_attitude_q();
 		_hold_q.normalize();
 
@@ -4268,6 +6419,7 @@ private:
 		_los_reacquire_active = false;
 		_los_reacquire_start_time = 0;
 		_los_reacquire_hold_logged = false;
+		reset_target_loss_grace();
 		_last_valid_guidance_cmd_valid = false;
 		_last_valid_guidance_cmd_time = 0;
 
@@ -4279,7 +6431,17 @@ private:
 		_transition_phase = 1.f;
 		_launch_sequence_complete = true;
 
+		// V21.4: RELEASE瞬间锁存当前Commander模式，后续任何模式变化都触发RC/系统接管。
+		_rc_override_latched = false;
+		_guidance_release_nav_state = _vehicle_status.nav_state;
+		_guidance_release_nav_state_valid = true;
+
 		PX4_INFO("RELEASE SIGNAL -> BPN ACTIVE (DIRECT, no CLEARANCE/TRANSITION)");
+		PX4_INFO("V22.04 GIMBAL PROTECT: %.2fs axial %.1f->%.1f m/s2 BPN %.0f->100%% slew %.0f->%.0f deg/s",
+			 (double)(GIMBAL_PROTECT_DURATION_US * 1e-6f),
+			 (double)GIMBAL_PROTECT_AXIAL_START, (double)AXIAL_ACCEL_MAX,
+			 (double)(GIMBAL_PROTECT_BPN_SCALE_START * 100.f),
+			 (double)GIMBAL_PROTECT_SLEW_START_DEG_S, (double)GUIDANCE_ATTITUDE_SLEW_DEG_S);
 		PX4_INFO("BPN direct cfg: hover=%.3f PN_N=%.2f BPN_MAX=%.2f axial_max=%.2f thrust=%.2f alt_floor=%.2f slew=%.1fdeg/s lead=%.1fdeg",
 			 (double)HOVER_THRUST, (double)PN_N, (double)BPN_ACCEL_MAX,
 			 (double)AXIAL_ACCEL_MAX, (double)GUIDANCE_THRUST_LIMIT, (double)ALT_FLOOR_THRUST_LIMIT,
@@ -4292,6 +6454,8 @@ private:
 	// Legacy path retained for rollback only when DIRECT_BPN_AFTER_RELEASE=false.
 	void enter_launch_clearance(const uint64_t now)
 	{
+		reset_bpn_jerk_limiter();
+		start_gimbal_protect_window(now);
 		_hold_q = current_attitude_q();
 
 		_clearance_start_accel_ned =
@@ -4318,24 +6482,38 @@ private:
 		_state_enter_time = now;
 		_transition_phase = 0.f;
 
+		// V21.4: legacy RELEASE路径同样建立模式基线。
+		_rc_override_latched = false;
+		_guidance_release_nav_state = _vehicle_status.nav_state;
+		_guidance_release_nav_state_valid = true;
+
 		_had_positive_closing = false;
 		_negative_closing_start_time = 0;
+		reset_target_loss_grace();
 
 		// V20 A/B统计从真正RELEASE重新开始，排除PrelaunchTracker发射前整体转动阶段。
 		reset_v20_truth_metrics();
 		_v20_metric_active = SIMULATION_MODE;
 
 		PX4_INFO("RELEASE SIGNAL -> LAUNCH_CLEARANCE");
+		PX4_INFO("V22.04 GIMBAL PROTECT: %.2fs axial %.1f->%.1f m/s2 BPN %.0f->100%% slew %.0f->%.0f deg/s",
+			 (double)(GIMBAL_PROTECT_DURATION_US * 1e-6f),
+			 (double)GIMBAL_PROTECT_AXIAL_START, (double)AXIAL_ACCEL_MAX,
+			 (double)(GIMBAL_PROTECT_BPN_SCALE_START * 100.f),
+			 (double)GIMBAL_PROTECT_SLEW_START_DEG_S, (double)GUIDANCE_ATTITUDE_SLEW_DEG_S);
 		PX4_INFO("V20 A/B metrics reset at RELEASE; reject truth rate > %.2f rad/s", (double)V20_METRIC_TRUTH_RATE_MAX);
 
-		PX4_INFO("CLEARANCE start_thr %.2f limit %.2f ramp %.2f s hold %.2f s",
-			 (double)CLEARANCE_START_THRUST,
-			 (double)CLEARANCE_THRUST_LIMIT,
-			 (double)(CLEARANCE_RAMP_DURATION_US * 1e-6f),
-			 (double)(CLEARANCE_HOLD_DURATION_US * 1e-6f));
-
-		PX4_INFO("CLEARANCE forward %.2f m/s^2, no fixed climb accel",
-			 (double)CLEARANCE_FORWARD_ACCEL);
+		if (!SIMULATION_MODE) {
+			PX4_INFO("CLEARANCE HW hold release attitude %.2f s start_thr %.2f limit %.2f",
+				 (double)(HW_CLEARANCE_HOLD_DURATION_US * 1e-6f),
+				 (double)CLEARANCE_START_THRUST, (double)CLEARANCE_THRUST_LIMIT);
+		} else {
+			PX4_INFO("CLEARANCE SITL start_thr %.2f limit %.2f ramp %.2f s hold %.2f s",
+				 (double)CLEARANCE_START_THRUST, (double)CLEARANCE_THRUST_LIMIT,
+				 (double)(CLEARANCE_RAMP_DURATION_US * 1e-6f),
+				 (double)(CLEARANCE_HOLD_DURATION_US * 1e-6f));
+			PX4_INFO("CLEARANCE SITL forward %.2f m/s^2, no fixed climb accel", (double)CLEARANCE_FORWARD_ACCEL);
+		}
 
 		PX4_INFO("GUIDANCE slew %.1f deg/s lead %.1f deg",
 			 (double)GUIDANCE_ATTITUDE_SLEW_DEG_S,
@@ -4360,6 +6538,36 @@ private:
 
 	void run_launch_clearance(const uint64_t now)
 	{
+		// V21.7真机：CLEARANCE仅保持RELEASE瞬间姿态100ms，降低机体角速度/云台补偿负担。
+		if (!SIMULATION_MODE) {
+			const uint64_t elapsed = now - _state_enter_time;
+			Vector3f accel_equiv_ned = attitude_thrust_to_net_accel(_hold_q, CLEARANCE_START_THRUST);
+
+			apply_release_altitude_floor_guard(accel_equiv_ned);
+
+			if (_alt_floor_active) {
+				constrain_net_accel_vertical_priority(accel_equiv_ned, CLEARANCE_THRUST_LIMIT);
+				publish_accel_attitude_setpoint(accel_equiv_ned, now);
+			} else {
+				publish_direct_attitude(_hold_q, CLEARANCE_START_THRUST, now);
+			}
+
+			_last_bpn_body.zero();
+			_last_axial_used = 0.f;
+			_last_bpn_norm_raw = 0.f;
+			_last_bpn_norm_used = 0.f;
+			_last_bpn_scale = 1.f;
+			_last_speed_brake = 0.f;
+			_last_predicted_thrust = predicted_thrust_norm_from_accel(accel_equiv_ned);
+			publish_guidance_acceleration(_last_bpn_body, false, now);
+			cache_valid_guidance_command(accel_equiv_ned, _last_bpn_body, now);
+
+			if (elapsed >= HW_CLEARANCE_HOLD_DURATION_US) {
+				enter_transition(now, accel_equiv_ned);
+			}
+			return;
+		}
+
 		// V18第二阶段诊断开关，默认false。
 		// 若第一轮TRUTH闭环仍有系统性上方越靶，可改true：
 		// CLEARANCE期间保持RELEASE瞬间姿态，不再主动拉向近水平姿态。
@@ -4500,6 +6708,46 @@ private:
 		_last_valid_guidance_cmd_valid = true;
 	}
 
+	void reset_target_loss_grace()
+	{
+		_target_loss_start_time = 0;
+		_target_loss_hold_logged = false;
+	}
+
+	bool hold_last_guidance_during_target_loss(const uint64_t now)
+	{
+		if (!_last_valid_guidance_cmd_valid || _last_valid_guidance_cmd_time == 0
+		    || now < _last_valid_guidance_cmd_time
+		    || now - _last_valid_guidance_cmd_time > TARGET_LOSS_GRACE_US + LOOP_INTERVAL_US) {
+			return false;
+		}
+
+		Vector3f accel_hold = _last_valid_guidance_accel_ned;
+		apply_release_altitude_floor_guard(accel_hold);
+
+		float active_thrust_limit = GUIDANCE_THRUST_LIMIT;
+		if (_state == GuidanceState::LAUNCH_CLEARANCE) {
+			active_thrust_limit = CLEARANCE_THRUST_LIMIT;
+		} else if (_state == GuidanceState::TRANSITION && _alt_floor_active) {
+			active_thrust_limit = CLEARANCE_THRUST_LIMIT;
+		} else if (_alt_floor_active) {
+			active_thrust_limit = ALT_FLOOR_THRUST_LIMIT;
+		}
+
+		constrain_net_accel_vertical_priority(accel_hold, active_thrust_limit);
+		_last_bpn_body = _last_valid_guidance_bpn_body;
+		_last_predicted_thrust = predicted_thrust_norm_from_accel(accel_hold);
+		publish_accel_attitude_setpoint(accel_hold, now);
+		publish_guidance_acceleration(_last_valid_guidance_bpn_body, false, now);
+
+		if (!_target_loss_hold_logged) {
+			PX4_WARN("TARGET LOSS grace: hold last valid guidance for <=%ums",
+				 (unsigned)(TARGET_LOSS_GRACE_US / 1000ULL));
+			_target_loss_hold_logged = true;
+		}
+		return true;
+	}
+
 	bool hold_last_guidance_during_los_reacquire(const uint64_t now, const char *phase_name)
 	{
 		if (!los_reacquire_grace_active(now) || !los_fresh(now) || !_los.target_valid || !attitude_valid()) {
@@ -4563,7 +6811,7 @@ private:
 
 		apply_release_altitude_floor_guard(accel_sp_ned);
 
-		// 正常TRANSITION使用0.75；如果高度保护正在工作，则临时开放到CLEARANCE的0.95。
+		// Legacy TRANSITION：正常使用GUIDANCE_THRUST_LIMIT；高度保护时沿用legacy CLEARANCE预算。
 		// 注意：这是“最大允许推力”，不是强制输出0.95。
 		const float active_thrust_limit =
 		    _alt_floor_active
@@ -4575,7 +6823,7 @@ private:
 		    active_thrust_limit
 		);
 
-		// TRANSITION回到正常BPN推力预算0.75。
+		// TRANSITION回到正常BPN推力预算。
 		// constrain_net_accel_vertical_priority(accel_sp_ned, GUIDANCE_THRUST_LIMIT);
 
 		_last_bpn_body = bpn_accel_body;
@@ -4657,12 +6905,12 @@ private:
 			return;
 		}
 
-		if (!_vc_valid || !_had_positive_closing) {
+		if (!los_fresh(now) || !_los.target_valid || !_vc_valid || !_had_positive_closing) {
 			_negative_closing_start_time = 0;
 			return;
 		}
 
-		const float speed = get_ekf_speed();
+		const float speed = get_guidance_speed();
 
 		if (!PX4_ISFINITE(speed) || speed < MISS_MIN_SPEED) {
 			_negative_closing_start_time = 0;
@@ -4690,6 +6938,7 @@ private:
 	void enter_safe_hover(const uint64_t now, const char *reason)
 	{
 		if (_state == GuidanceState::SAFE_HOVER) { return; }
+		reset_bpn_jerk_limiter();
 
 		PX4_WARN("-> SAFE_HOVER: %s", reason);
 
@@ -4708,6 +6957,7 @@ private:
 
 		_last_speed_brake = 0.f;
 		_alt_floor_active = false;
+		reset_target_loss_grace();
 
 		if (attitude_valid()) {
 			_last_q_sp = current_attitude_q();
@@ -4721,11 +6971,12 @@ private:
 	{
 		Vector3f accel_sp{0.f, 0.f, 0.f};
 
-		if (!velocity_valid()) { return accel_sp; }
+		Vector3f velocity_ned;
+		if (!get_guidance_velocity_ned(velocity_ned)) { return accel_sp; }
 
-		accel_sp(0) = -SAFE_BRAKE_KV_XY * _local_position.vx;
-		accel_sp(1) = -SAFE_BRAKE_KV_XY * _local_position.vy;
-		accel_sp(2) = -SAFE_BRAKE_KV_Z * _local_position.vz;
+		accel_sp(0) = -SAFE_BRAKE_KV_XY * velocity_ned(0);
+		accel_sp(1) = -SAFE_BRAKE_KV_XY * velocity_ned(1);
+		accel_sp(2) = -SAFE_BRAKE_KV_Z * velocity_ned(2);
 
 		constrain_xy(accel_sp, SAFE_BRAKE_ACCEL_XY_MAX);
 
@@ -4837,8 +7088,11 @@ private:
 	// EKF local position reset监控
 	// ============================================================
 
-	void monitor_ekf_resets()
+	void monitor_ekf_resets(const uint64_t now, const bool prev_velocity_valid,
+				const Vector3f &prev_velocity_ned, const uint64_t prev_lpos_rx_time)
 	{
+		bool velocity_reset_event = false;
+
 		if (!_ekf_reset_counter_initialized) {
 			_last_xy_reset_counter = _local_position.xy_reset_counter;
 			_last_z_reset_counter = _local_position.z_reset_counter;
@@ -4889,6 +7143,7 @@ private:
 				(unsigned)_local_position.vxy_reset_counter
 			);
 
+			velocity_reset_event = true;
 			_last_vxy_reset_counter = _local_position.vxy_reset_counter;
 		}
 
@@ -4899,7 +7154,27 @@ private:
 				(unsigned)_local_position.vz_reset_counter
 			);
 
+			velocity_reset_event = true;
 			_last_vz_reset_counter = _local_position.vz_reset_counter;
+		}
+
+		bool jump_event = false;
+		float velocity_jump = 0.f;
+		if (prev_velocity_valid && velocity_valid() && prev_lpos_rx_time > 0 && now >= prev_lpos_rx_time
+		    && now - prev_lpos_rx_time <= EKF_VEL_JUMP_MAX_DT_US) {
+			const Vector3f new_velocity{_local_position.vx, _local_position.vy, _local_position.vz};
+			velocity_jump = (new_velocity - prev_velocity_ned).norm();
+			jump_event = PX4_ISFINITE(velocity_jump) && velocity_jump > EKF_VEL_JUMP_TRIGGER_MPS;
+		}
+
+		if (jump_event) {
+			PX4_WARN("EKF velocity jump %.2fm/s in %.1fms",
+				 (double)velocity_jump,
+				 (double)((now - prev_lpos_rx_time) * 1e-3f));
+		}
+
+		if (velocity_reset_event || jump_event) {
+			start_ekf_velocity_guard(now, prev_velocity_ned, velocity_reset_event ? "RESET_COUNTER" : "DV_JUMP");
 		}
 	}
 
@@ -4947,13 +7222,29 @@ private:
 
 		const Eulerf delta_euler{delta_q};
 		const float delta_yaw = delta_euler.psi();
+		const float delta_angle_rad = 2.f * acosf(math::constrain(fabsf(delta_q(0)), 0.f, 1.f));
+		_last_attitude_reset_angle_deg = delta_angle_rad * 180.f / M_PI_F;
 
 		PX4_WARN(
-			"EKF ATT RESET %u -> %u dYaw=%.1f deg",
+			"EKF ATT RESET %u -> %u dYaw=%.1f deg dAngle=%.1f deg",
 			(unsigned)old_counter,
 			(unsigned)new_counter,
-			(double)(delta_yaw * 180.f / M_PI_F)
+			(double)(delta_yaw * 180.f / M_PI_F),
+			(double)_last_attitude_reset_angle_deg
 		);
+
+		// V22.06: a quaternion reset is a reference correction, not a physical body impulse.
+		// The BPN jerk state lives in the previous estimated geometry; re-seed it from the next raw BPN sample
+		// instead of forcing the limiter to slew across an artificial coordinate discontinuity.
+		reset_bpn_jerk_limiter();
+		if (_last_attitude_reset_angle_deg >= ATT_RESET_GUARD_TRIGGER_DEG
+		    || fabsf(delta_yaw) * 180.f / M_PI_F >= ATT_RESET_GUARD_TRIGGER_DEG) {
+			_attitude_reset_guard_until = now + ATT_RESET_GUARD_DURATION_US;
+			PX4_WARN("V22.06 ATT RESET GUARD %.0fms axial<=%.1f slew<=%.0f lead<=%.0f",
+				(double)(ATT_RESET_GUARD_DURATION_US * 1e-3f),
+				(double)ATT_RESET_GUARD_AXIAL_CAP, (double)ATT_RESET_GUARD_SLEW_CAP_DEG_S,
+				(double)ATT_RESET_GUARD_LEAD_CAP_DEG);
+		}
 
 		if (_yaw_locked) {
 			const float old_yaw = _yaw_lock;
@@ -5139,8 +7430,8 @@ private:
 
 		const float los_rate_mag = los_dot_guidance.norm();
 		speed_target = calculate_guidance_speed_target(los_rate_mag);
-		const float ekf_speed = get_ekf_speed();
-		const float axial_scale = PX4_ISFINITE(ekf_speed) ? calculate_axial_speed_scale(ekf_speed, speed_target) : 1.f;
+		const float guidance_speed = get_guidance_speed();
+		const float axial_scale = PX4_ISFINITE(guidance_speed) ? calculate_axial_speed_scale(guidance_speed, speed_target) : 1.f;
 		const float axial_limit = AXIAL_ACCEL_MAX * axial_scale;
 
 		const Vector3f bpn_guidance = calculate_bpn_body(los_guidance, los_dot_guidance, _vc_used);
@@ -5254,8 +7545,8 @@ private:
 	//       -> 正式轴向加速度/速度管理/0.75推力预算分配
 	//       -> 【V21.1】仅在固定台架Stage3把法向BPN乘RIG_STAGE3_BPN_SCALE=0.20
 	//       -> 正式acceleration_to_attitude()
-	//       -> 正式BPN姿态slew(60deg/s)
-	//       -> 正式attitude lead(60deg)
+	//       -> 正式BPN姿态slew(当前85deg/s)
+	//       -> 正式attitude lead(当前65deg)
 	//       -> 台架最终安全cage(8deg)
 	//
 	// 与正式run_bpn()有意保留的差异：
@@ -5283,7 +7574,7 @@ private:
 		}
 
 		// 先单独保留“正式BPN原始法向加速度”，便于RIG_RT直接观察目标运动对应的BPN。
-		// _vc_used在室内velocity无效时由update_closing_speed()自动回退VC_FALLBACK=20m/s，
+		// _vc_used在室内velocity无效时由update_closing_speed()自动回退VC_FALLBACK=10m/s，
 		// 与正式BPN代码路径完全一致，而不是Stage2专用RIG_BPN_ACCEL_MAX=3m/s^2。
 		const Vector3f los_g = calculate_los_body(_los.gimbal_roll, _los.gimbal_pitch,
 			_los_miss_az_est, _los_miss_el_est);
@@ -5315,7 +7606,7 @@ private:
 		_last_bpn_norm_used = bpn_used_body.norm();
 		_diag_bpn_used_body = bpn_used_body;
 
-		// 与正式run_bpn()保持一致的最终0.75预算兜底。
+		// 与正式run_bpn()保持一致的最终GUIDANCE_THRUST_LIMIT预算兜底。
 		// 固定台架刻意不调用apply_release_altitude_floor_guard()。
 		constrain_net_accel_vertical_priority(accel_cmd_ned, GUIDANCE_THRUST_LIMIT);
 		_last_predicted_thrust = predicted_thrust_norm_from_accel(accel_cmd_ned);
@@ -5328,7 +7619,7 @@ private:
 
 		acceleration_to_attitude(accel_cmd_ned, yaw_stage3, q_raw, thrust_preview);
 
-		// 正式BPN姿态setpoint变化率：60deg/s。
+		// 正式BPN姿态setpoint变化率：当前85deg/s。
 		float dt = LOOP_INTERVAL_US * 1e-6f;
 		if (_last_setpoint_pub_time > 0 && now > _last_setpoint_pub_time) {
 			dt = (float)(now - _last_setpoint_pub_time) * 1e-6f;
@@ -5345,7 +7636,7 @@ private:
 
 		_diag_q_slew = q_slew;
 
-		// 正式BPN attitude lead上限：60deg。
+		// 正式BPN attitude lead上限：当前65deg。
 		float lead_angle_rad = 0.f;
 		Quatf q_real_cmd = slerp_limited(
 			current_attitude_q(),
@@ -5864,6 +8155,10 @@ private:
 		_last_print_time = now;
 
 		const float ekf_speed = get_ekf_speed();
+		const float guidance_speed = get_guidance_speed();
+		const float imu_speed = imu_velocity_available() ? _imu_velocity_ned.norm() : NAN;
+		const float imu_age_s = (_imu_velocity_anchor_time > 0 && now >= _imu_velocity_anchor_time)
+			? (float)(now - _imu_velocity_anchor_time) * 1e-6f : NAN;
 		const Eulerf att_euler{current_attitude_q()};
 		const Eulerf sp_euler{_last_q_sp};
 
@@ -5886,23 +8181,30 @@ private:
 			? CLEARANCE_THRUST_LIMIT
 			: (_alt_floor_active ? ALT_FLOOR_THRUST_LIMIT : GUIDANCE_THRUST_LIMIT);
 
-		PX4_INFO("DBG5 H st=%u launch=%d tgt=%d fresh=%d rate=%d body=%d VC=%.2f/%.2f/%.2f v=%d spd=%.2f tgtSpd=%.1f",
+		PX4_INFO("DBG5 H st=%u launch=%d tgt=%d fresh=%d rate=%d body=%d VC=%.2f/%.2f/%.2f VaLOS=%.2f VtLOS=%.2f v=%d src=%s guard=%d/%d a=%.2f diff=%.2f spd=%.2f EKF=%.2f IMU=%.2f age=%.2fs tgtSpd=%.1f",
 			 (unsigned)_state, (int)_launch_sequence_complete,
 			 (int)_los.target_valid, (int)los_fresh(now), (int)_inertial_los_rate_valid, (int)body_rate_valid(now),
-			 (double)_vc_raw, (double)_vc_filtered, (double)_vc_used, (int)_vc_valid,
-			 (double)ekf_speed, (double)_last_speed_target);
+			 (double)_vc_raw, (double)_vc_filtered, (double)_vc_used,
+			 (double)_vc_aircraft_only, (double)_vc_target_projection,
+			 (int)_vc_valid, guidance_velocity_source_name(),
+			 (int)_ekf_velocity_guard_active, (int)_ekf_velocity_blend_active,
+			 (double)_ekf_velocity_blend_alpha, (double)_last_ekf_imu_velocity_diff,
+			 (double)guidance_speed, (double)ekf_speed, (double)imu_speed, (double)imu_age_s, (double)_last_speed_target);
 
-		PX4_INFO("DBG5 LOS IN=[%+.4f %+.4f %+.4f]|%.4f R=[%+.4f %+.4f] B=[%+.2f %+.2f %+.2f] norm=%.2f->%.2f scale=%.2f",
+		PX4_INFO("DBG5 LOS IN=[%+.4f %+.4f %+.4f]|%.4f CTRL=[%+.4f %+.4f %+.4f] pred=%d %.0fms/%.1fdeg B=[%+.2f %+.2f %+.2f] norm=%.2f->%.2f scale=%.2f",
 			 (double)_los_dot_inertial_body(0), (double)_los_dot_inertial_body(1), (double)_los_dot_inertial_body(2),
-			 (double)_los_dot_inertial_body.norm(), (double)_los.los_az_rate, (double)_los.los_el_rate,
+			 (double)_los_dot_inertial_body.norm(),
+			 (double)_los_dot_control_body(0), (double)_los_dot_control_body(1), (double)_los_dot_control_body(2),
+			 (int)_los_prediction_valid, (double)(_los_prediction_age_us * 1e-3f), (double)_los_prediction_angle_deg,
 			 (double)_last_bpn_body(0), (double)_last_bpn_body(1), (double)_last_bpn_body(2),
 			 (double)_last_bpn_norm_raw, (double)_last_bpn_norm_used, (double)_last_bpn_scale);
 
-		PX4_INFO("DBG5 CMD axial=%.2f/%.2f brake=%.2f Tpred=%.3f Tsp=%.3f budget=%.2f slew=%d lead=%d alt=%d drop=%.2f up=%.2f",
+		PX4_INFO("DBG5 CMD axial=%.2f/%.2f brake=%.2f Tpred=%.3f Tsp=%.3f budget=%.2f slew=%d lead=%d feas=%d tilt=%.1f->%.1f alt=%d drop=%.2f up=%.2f",
 			 (double)_last_axial_used, (double)_last_axial_limit_cmd, (double)_last_speed_brake,
 			 (double)_last_predicted_thrust, (double)_last_thrust_sp, (double)active_budget,
-			 (int)_slew_active, (int)_lead_active, (int)_alt_floor_active,
-			 (double)_last_alt_floor_drop, (double)_last_alt_floor_up_accel);
+			 (int)_slew_active, (int)_lead_active, (int)_last_thrust_vector_feasibility_limited,
+			 (double)_last_thrust_vector_raw_tilt_deg, (double)_last_thrust_vector_cmd_tilt_deg,
+			 (int)_alt_floor_active, (double)_last_alt_floor_drop, (double)_last_alt_floor_up_accel);
 
 		PX4_INFO("DBG5 CTL att=[%+.1f %+.1f] sp=[%+.1f %+.1f] err=%.1f rateSP=[%+.2f %+.2f] rate=[%+.2f %+.2f] TQ=[%+.3f %+.3f] MOTmin/avg/max=%.3f/%.3f/%.3f",
 			 (double)(att_euler.phi()*180.f/M_PI_F), (double)(att_euler.theta()*180.f/M_PI_F),
@@ -5912,6 +8214,12 @@ private:
 			 (double)_angular_velocity.xyz[0], (double)_angular_velocity.xyz[1],
 			 (double)_vehicle_torque_setpoint.xyz[0], (double)_vehicle_torque_setpoint.xyz[1],
 			 (double)min_motor, (double)avg_motor, (double)max_motor);
+		PX4_INFO("DBG6 GIM risk=%.2f geo=%.2f dyn=%.2f ctrl=%.2f st=%u off=%.1f rate=%.1f acc=%.0f caps A=%.2f S=%.1f L=%.1f reset_guard=%d",
+			 (double)_gimbal_load, (double)_gimbal_geometry_load, (double)_gimbal_dynamic_load,
+			 (double)_gimbal_control_load, (unsigned)_gimbal_load_state, (double)_gimbal_offaxis_deg,
+			 (double)_gimbal_rate_mag_deg_s, (double)_gimbal_accel_mag_filtered_deg_s2,
+			 (double)_gimbal_supervisor_axial_cap, (double)_gimbal_supervisor_slew_cap_deg_s,
+			 (double)_gimbal_supervisor_lead_cap_deg, (int)attitude_reset_guard_active(now));
 	}
 
 	// ============================================================
@@ -5939,6 +8247,7 @@ private:
 
 		// body rate是V20 Body-relative observer的核心输入，同时用于健康检查和BENCH诊断。
 		if (_angular_velocity_sub.update(&_angular_velocity)) { _last_body_rate_rx_time = now; push_body_rate_history(now); }
+		if (_vehicle_acceleration_sub.update(&_vehicle_acceleration)) { _last_accel_rx_time = now; }
 
 		if (SIMULATION_MODE) {
 			// SITL继续使用Gazebo/Python发布的vehicle_target_los，保持原仿真链和TRUTH A/B逻辑不变。
@@ -5953,6 +8262,9 @@ private:
 				(void)update_los_from_cgtd070(_cgtd070_status, now);
 			}
 		}
+
+		// V22.06: update gimbal-load protection after the newest gimbal/LOS packet and observer update.
+		update_gimbal_load_supervisor(now);
 
 		// V20 SITL仿真真值旁路：
 		// pymavlink DEBUG_VECT(name="LOS_TRUE")由mavlink_receiver转成uORB debug_vect。
@@ -5986,11 +8298,21 @@ private:
 		// local position
 		// --------------------------------------------------------
 
+		const bool prev_velocity_valid = velocity_valid();
+		const Vector3f prev_velocity_ned = prev_velocity_valid
+			? Vector3f{_local_position.vx, _local_position.vy, _local_position.vz}
+			: Vector3f{NAN, NAN, NAN};
+		const uint64_t prev_lpos_rx_time = _last_local_position_rx_time;
+
 		if (_local_position_sub.update(&_local_position)) {
-			monitor_ekf_resets();
+			_last_local_position_rx_time = now;
+			monitor_ekf_resets(now, prev_velocity_valid, prev_velocity_ned, prev_lpos_rx_time);
 		}
 
 		_vehicle_status_sub.update(&_vehicle_status);
+
+		// V21.11：EKF有效时锚定；EKF无效时在短时间内用IMU积分速度接管速度参考。
+		update_imu_velocity_estimator(now);
 
 		// --------------------------------------------------------
 		// manual control / RC RELEASE input
@@ -6005,7 +8327,7 @@ private:
 		if (_vehicle_torque_setpoint_sub.update(&_vehicle_torque_setpoint)) { _last_torque_setpoint_rx_time = now; }
 		if (_vehicle_thrust_setpoint_sub.update(&_vehicle_thrust_setpoint)) { _last_thrust_setpoint_rx_time = now; }
 
-		// 每周期根据LOS + EKF更新闭合速度。
+		// 每周期根据current-time LOS + EKF/短时IMU速度源更新闭合速度。
 		update_closing_speed(now);
 
 		// BENCH_RT默认关闭；执行“pn_guidance bench on”后每200ms(5Hz)打印一次完整只读预览。
@@ -6078,9 +8400,12 @@ private:
 		}
 
 		if (!is_armed && _was_armed) {
+			reset_imu_velocity_fallback();
 			_launch_sequence_complete = false;
 			_transition_phase = 1.f;
 			reset_rc_release_interlock();
+			reset_rc_override_latch();
+			reset_target_loss_grace();
 
 			_had_positive_closing = false;
 			_negative_closing_start_time = 0;
@@ -6109,6 +8434,19 @@ private:
 		}
 
 		_was_armed = is_armed;
+
+		// --------------------------------------------------------
+		// V21.4 RC绝对优先级仲裁
+		// --------------------------------------------------------
+		update_rc_authority(now, is_armed);
+
+		if (_rc_override_latched) {
+			// 这里故意不发布vehicle_attitude_setpoint；mc_att_control/Commander拥有最终控制权。
+			_last_bpn_body.zero();
+			publish_guidance_acceleration(_last_bpn_body, false, now);
+			publish_pn_guidance_diag(now);
+			return;
+		}
 
 		// --------------------------------------------------------
 		// SP_IFACE未解锁零推力接口测试。启用后本周期由该路径唯一发布pn_guidance自己的姿态setpoint，
@@ -6145,16 +8483,22 @@ private:
 				PX4_ERR("%s refused: attitude invalid", source);
 			} else if (!release_altitude_reference_ready()) {
 				PX4_ERR("%s refused: local Z/VZ invalid; altitude floor unavailable", source);
+			} else if (!SIMULATION_MODE && rc_manual_attitude_owner_active(now)) {
+				PX4_ERR("%s refused: RC Manual/Stabilized/Acro mode owns control; switch to guidance mode then AUX1 LOW->HIGH", source);
 			} else if (DIRECT_BPN_AFTER_RELEASE && !control_los_rate_ready(now)) {
 				// 旧流程可借CLEARANCE/TRANSITION等待observer建立；直接BPN没有这个缓冲，因此RELEASE前必须确认BPN LOS-rate已经可用。
 				PX4_ERR("%s refused: direct BPN LOS-rate not ready", source);
 			} else if (DIRECT_BPN_AFTER_RELEASE && !body_rate_valid(now)) {
 				PX4_ERR("%s refused: direct BPN body-rate input stale", source);
 			} else if (DIRECT_BPN_AFTER_RELEASE) {
+				// V21.9.1：RELEASE真正接受后，以此刻真实姿态重新锁Yaw，再进入正式控制。
+				relock_yaw_at_release(source);
 				// V21.2方案A：RELEASE后同一控制周期直接进入完整BPN ACTIVE。
 				enter_bpn_active(now);
 			} else {
-				// Legacy fallback：保留旧CLEARANCE -> TRANSITION -> BPN流程，当前默认不使用。
+				// V21.9.1：v21.9正式路径同样在进入CLEARANCE前刷新Yaw；其余0.10s+0.30s过渡不变。
+				relock_yaw_at_release(source);
+				// Legacy fallback：保留旧CLEARANCE -> TRANSITION -> BPN流程；v21.9默认走此路径。
 				enter_launch_clearance(now);
 			}
 		}
@@ -6166,15 +8510,50 @@ private:
 		monitor_target_pass(now);
 
 		// --------------------------------------------------------
-		// LOS失效保护
+		// V21.7 LOS/target失效保护：stale立即SAFE；target/control LOS短时false给250ms宽限。
 		// --------------------------------------------------------
+		if (formal_guidance_active()) {
+			const bool control_los_ready_now =
+				_los.target_valid
+				&& (_state == GuidanceState::LAUNCH_CLEARANCE || control_los_rate_ready(now));
 
-		if ((_state == GuidanceState::LAUNCH_CLEARANCE
-		     || _state == GuidanceState::TRANSITION
-		     || (_state == GuidanceState::BPN && _launch_sequence_complete))
-		    && (!los_fresh(now) || !_los.target_valid)) {
+			if (!los_fresh(now)) {
+				reset_target_loss_grace();
+				enter_safe_hover(now, "LOS stale");
 
-			enter_safe_hover(now, "LOS invalid/stale");
+			} else if (!control_los_ready_now) {
+				if (_target_loss_start_time == 0) {
+					_target_loss_start_time = now;
+					_target_loss_hold_logged = false;
+				}
+
+				const uint64_t loss_elapsed = now >= _target_loss_start_time
+					? now - _target_loss_start_time : TARGET_LOSS_GRACE_US + 1;
+
+				if (loss_elapsed <= TARGET_LOSS_GRACE_US) {
+					if (!hold_last_guidance_during_target_loss(now)) {
+						if (attitude_valid() && _last_setpoint_pub_time > 0) {
+							publish_direct_attitude(_last_q_sp, _last_thrust_sp, now);
+						}
+						_last_bpn_body.zero();
+						publish_guidance_acceleration(_last_bpn_body, false, now);
+					}
+					publish_pn_guidance_diag(now);
+					if (!_bench_realtime_enabled.load()) { print_debug(now); }
+					return;
+				}
+
+				enter_safe_hover(now, "target/control LOS invalid >250ms");
+
+			} else if (_target_loss_start_time != 0) {
+				const uint64_t paused_us = now >= _target_loss_start_time ? now - _target_loss_start_time : 0;
+				if ((_state == GuidanceState::LAUNCH_CLEARANCE || _state == GuidanceState::TRANSITION)
+				    && paused_us > 0 && paused_us <= TARGET_LOSS_GRACE_US + LOOP_INTERVAL_US) {
+					_state_enter_time += paused_us;
+				}
+				PX4_INFO("TARGET REACQUIRED after %.1fms; resume guidance", (double)paused_us * 1e-3);
+				reset_target_loss_grace();
+			}
 		}
 
 		// --------------------------------------------------------

@@ -175,6 +175,7 @@ void LoggedTopics::add_default_topics()
 	add_topic("pn_guidance_prediction_diag");
 	add_topic("pn_guidance_rate_estimator_diag");
 	add_topic("cgtd070_diag", 100);
+	add_topic("pn_guidance_observer_diag", 20);
 	// EKF multi topics
 	{
 		// optionally log all estimator* topics at minimal rate

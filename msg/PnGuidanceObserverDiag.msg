@@ -1,0 +1,30 @@
+# V21.12 shadow-only LOS observer A/B diagnostics.
+# Logging only; not a control input.
+uint64 timestamp
+uint64 sample_time
+uint32 seq
+float32 sample_age_ms
+float32 shadow_dt_ms
+float32 shadow_residual_angle_deg
+float32 shadow_filter_alpha
+float32[2] miss_rate_formal
+float32[2] miss_rate_backward3
+float32[3] formal_rate
+float32[3] shadow_rate_raw
+float32[3] shadow_rate_filt
+float32 formal_rate_mag
+float32 shadow_rate_raw_mag
+float32 shadow_rate_filt_mag
+float32 formal_shadow_rate_angle_deg
+float32[3] formal_pred_los
+float32[3] shadow_pred_los
+float32 formal_prediction_age_ms
+float32 shadow_prediction_age_ms
+float32 formal_shadow_pred_angle_deg
+uint16 version
+uint8 miss_rate_mode
+uint8 formal_rate_valid
+uint8 shadow_rate_valid
+uint8 formal_prediction_valid
+uint8 shadow_prediction_valid
+uint8 target_valid
